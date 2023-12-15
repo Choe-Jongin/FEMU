@@ -433,14 +433,16 @@ void ns_init(FemuCtrl *n, NvmeNamespace *ns)
     struct ssd *ssd = n->ssd;
     struct ssdparams *spp = &ssd->sp;
 
-    // phy_size = ns_size * (1 + OP)
+    // phy_size = ns->size(MB) * (1 + OP)
     uint64_t phy_size;
     phy_size = ns->size/(1024*1024) * ((uint64_t)spp->tt_secs * spp->secsz) / n->memsz;
     ns->ssd = ssd;
-    ns->lm = g_malloc0(sizeof(struct write_pointer));
-    ns->wp = g_malloc0(sizeof(struct line_mgmt));
+    ns->lm = g_malloc0(sizeof(struct line_mgmt));
+    ns->wp = g_malloc0(sizeof(struct write_pointer));
     
     namespace_init_params(&ns->sp, spp, phy_size);
+
+    printf("physical:%ldByte, ch:%d\r\n", phy_size, ns->sp.nchs);
 
     set_ns_start_lpn(ns);
     ssd_init_lines(ns);

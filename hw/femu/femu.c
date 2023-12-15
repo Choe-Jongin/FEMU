@@ -411,10 +411,9 @@ static void nvme_init_ctrl(FemuCtrl *n)
     id->frmw         = 7 << 1 | 1;
     id->lpa          = NVME_LPA_NS_SMART | NVME_LPA_CSE | NVME_LPA_EXTENDED;
     id->elpe         = n->elpe;
-    id->npss         = 0;
     id->sqes         = (n->max_sqes << 4) | 0x6;
     id->cqes         = (n->max_cqes << 4) | 0x4;
-    /* ns is a maximum number of namespace, not current number of namespace */
+    /* nn is a maximum number of namespace, not current number of namespace */
     // id->nn           = cpu_to_le32(n->num_namespaces);   
     id->nn           = NVME_MAX_NUM_NAMESPACES;
     id->oncs         = cpu_to_le16(n->oncs);
@@ -562,10 +561,11 @@ static void femu_realize(PCIDevice *pci_dev, Error **errp)
     nvme_init_namespaces(n, errp, n->ns_size);
 
     nvme_register_extensions(n);
-
+    
     if (n->ext_ops.init) {
         n->ext_ops.init(n, errp);
     }
+    usleep(1000*1000);
 }
 
 static void nvme_destroy_poller(FemuCtrl *n)

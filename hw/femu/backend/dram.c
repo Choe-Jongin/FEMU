@@ -84,7 +84,7 @@ int backend_rw_namespace(SsdDramBackend *b, QEMUSGList *qsg, uint64_t *lbal, boo
     return 0;
 }
 
-/* For compatibility with the original (No NS) version */
+/* For compatibility with the original (single NS SSD) version */
 int backend_rw(SsdDramBackend *b, QEMUSGList *qsg, uint64_t *lbal, bool is_write){
     return backend_rw_namespace(b, qsg, lbal, is_write, 1);
 }

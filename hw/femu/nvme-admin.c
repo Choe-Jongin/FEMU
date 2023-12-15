@@ -1107,13 +1107,16 @@ static uint16_t nvme_namespace_management(FemuCtrl *n, NvmeCmd *cmd, NvmeCqe *cq
             if(dma_write_prp(n, (uint8_t *)&(ns->id_ns), sizeof(NvmeIdNs), prp1, prp2) != NVME_SUCCESS){
                 return NVME_INVALID_FIELD | NVME_DNR;
             }
-
-            ns->size = ns->id_ns.nsze;
-            init_dram_backend_logical_space(&n->mbe, new_nsid, ns->size);
+            
+            /* ns->size = nsze(# of block(page)) * block_size*/
+            // ns->size = ns->id_ns.nsze*ns->id_ns.lbaf[0].lbads;
+            ns->size = ns->id_ns.nsze*(4096);
             if (nvme_init_namespace(n, ns, NULL)) {
                 return 1;
             }
+            /* TODO : size validity check(ch size, OP, etc..) */
 
+            init_dram_backend_logical_space(&n->mbe, new_nsid, ns->size);
             ns_init(n, ns);
 
             cqe->res64 = new_nsid;
