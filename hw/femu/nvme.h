@@ -1081,9 +1081,9 @@ struct namespace_params {
                        */
 
     double gc_thres_pcent;
-    int gc_thres_lines;
+    int gc_thres_blocks;
     double gc_thres_pcent_high;
-    int gc_thres_lines_high;
+    int gc_thres_blocks_high;
     bool enable_gc_delay;
 
     /* below are all calculated values */
@@ -1172,9 +1172,11 @@ typedef struct NvmeNamespace {
     /* for multi namespaces(only black-box) */
     struct namespace_params sp;
     void *wp;   // write_pointer
-    void *lm;   // line_mgmt
+    void *bm;   // block_mgmt
     void *ssd;
     int start_lpn;
+
+    int *ch_list;
 
     void *state;
 } NvmeNamespace;

@@ -94,6 +94,34 @@ static uint16_t bb_admin_cmd(FemuCtrl *n, NvmeCmd *cmd)
     case NVME_ADM_CMD_FEMU_FLIP:
         bb_flip(n, cmd);
         return NVME_SUCCESS;
+    case 0x32:
+        int nsid1, ch1, nsid2, ch2;
+
+        nsid1 = le64_to_cpu(cmd->cdw10);
+        ch1   = le64_to_cpu(cmd->cdw11);
+        nsid2 = le64_to_cpu(cmd->cdw12);
+        ch2   = le64_to_cpu(cmd->cdw13);
+
+        struct NvmeNamespace *ns1 = &n->namespaces[nsid1-1];
+        struct NvmeNamespace *ns2 = &n->namespaces[nsid2-1];
+
+        printf("Channel swap command [namespace %d, %dch(physic:%dch)] <-> [namespace %d, %dch(physic:%dch)]\r\n", nsid1, ch1, ns1->ch_list[ch1], nsid2, ch2, ns2->ch_list[ch2]);
+        ch_swap(ns1, ch1, ns2, ch2);
+
+        printf("nsid:%d( ", nsid1);
+        for( int i = 0 ; i < ns1->sp.nchs ; i++){
+            printf("%2dch ", ns1->ch_list[i]);
+        }
+        printf(")\r\n");
+
+        printf("nsid:%d( ", nsid2);
+        for( int i = 0 ; i < ns2->sp.nchs ; i++){
+            printf("%2dch ", ns2->ch_list[i]);
+        }
+        printf(")\r\n");
+
+        return NVME_SUCCESS;
+        
     default:
         return NVME_INVALID_OPCODE | NVME_DNR;
     }

@@ -179,7 +179,7 @@ void *pqueue_pop(pqueue_t *q)
     head = q->d[1];
     q->d[1] = q->d[--q->size];
     percolate_down(q, 1);
-
+    // q->setpos(head, 0);
     return head;
 }
 
