@@ -34,6 +34,10 @@
 #define right(i)  (((i) << 1) + 1)
 #define parent(i) ((i) >> 1)
 
+int mutex_change = 0;
+int mutex_remove = 0;
+int mutex_pop = 0;
+
 pqueue_t *pqueue_init(size_t n, pqueue_cmp_pri_f cmppri, pqueue_get_pri_f getpri,
         pqueue_set_pri_f setpri, pqueue_get_pos_f getpos, pqueue_set_pos_f setpos)
 {
@@ -146,6 +150,9 @@ int pqueue_insert(pqueue_t *q, void *d)
 
 void pqueue_change_priority(pqueue_t *q, pqueue_pri_t new_pri, void *d)
 {
+    while(mutex_change) ;
+    mutex_change = 1;
+
     size_t posn;
     pqueue_pri_t old_pri = q->getpri(d);
 
@@ -155,10 +162,14 @@ void pqueue_change_priority(pqueue_t *q, pqueue_pri_t new_pri, void *d)
         bubble_up(q, posn);
     else
         percolate_down(q, posn);
+
+    mutex_change= 0;
 }
 
 int pqueue_remove(pqueue_t *q, void *d)
 {
+    while(mutex_remove) ;
+    mutex_remove = 1;
     size_t posn = q->getpos(d);
     q->d[posn] = q->d[--q->size];
     if (q->cmppri(q->getpri(d), q->getpri(q->d[posn])))
@@ -166,11 +177,14 @@ int pqueue_remove(pqueue_t *q, void *d)
     else
         percolate_down(q, posn);
 
+    mutex_remove = 0;
     return 0;
 }
 
 void *pqueue_pop(pqueue_t *q)
 {
+    while(mutex_pop) ;
+    mutex_pop = 1;
     void *head;
 
     if (!q || q->size == 1)
@@ -180,6 +194,7 @@ void *pqueue_pop(pqueue_t *q)
     q->d[1] = q->d[--q->size];
     percolate_down(q, 1);
 
+    mutex_pop = 0;
     return head;
 }
 

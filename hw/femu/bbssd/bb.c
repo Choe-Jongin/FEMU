@@ -94,6 +94,41 @@ static uint16_t bb_admin_cmd(FemuCtrl *n, NvmeCmd *cmd)
     case NVME_ADM_CMD_FEMU_FLIP:
         bb_flip(n, cmd);
         return NVME_SUCCESS;
+
+    case 0x32:      // 명시적 swap
+        int nsid1, ch1, nsid2, ch2;
+
+        nsid1 = le64_to_cpu(cmd->cdw10);
+        ch1   = le64_to_cpu(cmd->cdw11);
+        nsid2 = le64_to_cpu(cmd->cdw12);
+        ch2   = le64_to_cpu(cmd->cdw13);
+
+        struct NvmeNamespace *ns1 = &n->namespaces[nsid1-1];
+        struct NvmeNamespace *ns2 = &n->namespaces[nsid2-1];
+
+        printf("Channel swap command [namespace%d, %dch(physical:%dch)] <-> [namespace%d, %dch(physical:%dch)]\r\n", 
+            nsid1, ch1, ns1->ch_list[ch1], nsid2, ch2, ns2->ch_list[ch2]);
+        run_swap_thread(ns1, ch1, ns2, ch2);
+
+        return NVME_SUCCESS;
+
+    case 0x33:      // seamless swap
+        // int nsid1, ch1, nsid2, ch2;
+
+        // nsid1 = le64_to_cpu(cmd->cdw10);
+        // ch1   = le64_to_cpu(cmd->cdw11);
+        // nsid2 = le64_to_cpu(cmd->cdw12);
+        // ch2   = le64_to_cpu(cmd->cdw13);
+
+        // struct NvmeNamespace *ns1 = &n->namespaces[nsid1-1];
+        // struct NvmeNamespace *ns2 = &n->namespaces[nsid2-1];
+
+        // printf("Channel swap command [namespace%d, %dch(physical:%dch)] <-> [namespace%d, %dch(physical:%dch)]\r\n", 
+        //     nsid1, ch1, ns1->ch_list[ch1], nsid2, ch2, ns2->ch_list[ch2]);
+        // run_swap_thread(ns1, ch1, ns2, ch2);
+
+        return NVME_SUCCESS;
+        
     default:
         return NVME_INVALID_OPCODE | NVME_DNR;
     }
