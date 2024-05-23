@@ -168,7 +168,7 @@ static void ssd_init_params(struct ssdparams *spp, FemuCtrl *n)
 
     check_params(spp);
 }
-
+ 
 static void namespace_init_params(struct namespace_params *npp, struct ssdparams *ssdp, uint64_t phy_size)
 {
     npp->secsz = ssdp->secsz;
@@ -741,11 +741,11 @@ static struct nand_block *select_victim_block(struct NvmeNamespace *ns, bool for
         return NULL;
     }
     
-    // if (!force && victim_block->ipc < ns->np.pgs_per_blk / 16) {        
-    //     return NULL;
-    // }
+    if (!force && victim_block->ipc < ns->np.pgs_per_blk / 16) {        
+        return NULL;
+    }
 
-    pqueue_pop(bm->victim_block_pq);
+    victim_block = pqueue_pop(bm->victim_block_pq);
     victim_block->pos = 0;
     bm->victim_block_cnt--;
 
@@ -806,8 +806,9 @@ static int do_gc(struct NvmeNamespace *ns, bool force)
         printf("ns%d No victim here!!\r\n", ns->id);
         return -1;
     }
-    // printf("GC nsid:%d, ch:%d, lun:%d, blk:%d\r\n", ns->id, victim_block->ppa.g.ch, victim_block->ppa.g.lun, victim_block->ppa.g.blk);
+    printf("GC nsid:%d, ch:%d, lun:%d, blk:%d\r\n", ns->id, victim_block->ppa.g.ch, victim_block->ppa.g.lun, victim_block->ppa.g.blk);
     free_block(ns, &victim_block->ppa);
+    printf("done\r\n");
     return 0;
 }
 
@@ -1455,19 +1456,17 @@ static void *ftl_thread(void *arg)
     /* FIXME: not safe, to handle ->to_ftl and ->to_poller gracefully */
     ssd->to_ftl = n->to_ftl;
     ssd->to_poller = n->to_poller;
-
     while (1) {
         for (i = 1; i <= n->nr_pollers; i++) {
             if (!ssd->to_ftl[i] || !femu_ring_count(ssd->to_ftl[i]))
                 continue;
-
             rc = femu_ring_dequeue(ssd->to_ftl[i], (void *)&req, 1);
             if (rc != 1) {
                 printf("FEMU: FTL to_ftl dequeue failed\n");
             }
 
             ftl_assert(req);
-
+            
             switch (req->cmd.opcode) {
             case NVME_CMD_WRITE:
                 lat = ssd_write(ssd, req);
@@ -1518,7 +1517,7 @@ static void *ftl_thread(void *arg)
             }
 
             /* timer setting */
-            next_time = now + 1*1000*1000*1000;
+            next_time = now + 1*1000*1000*100;
         }
     }
     return NULL;
@@ -1547,7 +1546,12 @@ void monitoring_to_file(void *arg)
             for( int blk = 0; blk < n->ssd->sp.blks_per_pl; blk++ ){
                 vpc += n->ssd->ch[ch].lun[lun].pl[0].blk[blk].vpc;
             }
-            fprintf(fp, "%2dch %dchip freeblock: %d  vpc %d\n", ch, lun, n->ssd->ch[ch].lun[lun].pl[0].free_block_cnt, vpc);
+            fprintf(fp, "%2dch %dchip freeblock %d  total_vpc %d vpc", ch, lun, n->ssd->ch[ch].lun[lun].pl[0].free_block_cnt, vpc);
+
+            for( int blk = 0; blk < n->ssd->sp.blks_per_pl; blk++ ){
+                fprintf(fp, " %3d", n->ssd->ch[ch].lun[lun].pl[0].blk[blk].vpc);
+            }
+            fprintf(fp, "\n");
         }
     }
     fclose(fp);

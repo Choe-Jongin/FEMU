@@ -1,0 +1,9 @@
+{
+    "files.associations": {
+        "statistic.h": "c",
+        "*.code": "c",
+        "pqueue.h": "c",
+        "*.idef": "c",
+        "*.def": "c"
+    }
+}

@@ -1,0 +1,11 @@
+{
+    "name": "My Desktop",
+    "host": "166.104.185.245",
+    "protocol": "sftp",
+    "port": 22,
+    "username": "jongin",
+    "password": "qkfgotkfkd",
+    "remotePath": "/home/jongin/femu",
+    "uploadOnSave": false,
+    "useTempFile": false
+}
