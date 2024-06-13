@@ -138,6 +138,8 @@ static void ssd_init_params(struct ssdparams *spp, FemuCtrl *n)
     spp->pg_wr_lat = n->bb_params.pg_wr_lat;
     spp->blk_er_lat = n->bb_params.blk_er_lat;
     spp->ch_xfer_lat = n->bb_params.ch_xfer_lat;
+    spp->gc_thres_pcent         = n->bb_params.gc_thres_pcent/100.0f;
+    spp->gc_thres_pcent_high    = n->bb_params.gc_thres_pcent_high/100.0f;
 
     /* calculated values */
     spp->secs_per_blk = spp->secs_per_pg * spp->pgs_per_blk;
@@ -160,9 +162,7 @@ static void ssd_init_params(struct ssdparams *spp, FemuCtrl *n)
 
     spp->tt_luns = spp->luns_per_ch * spp->nchs;
 
-    spp->gc_thres_pcent         = 0.75;
     spp->gc_thres_blocks         = (int)((1 - spp->gc_thres_pcent) * spp->tt_blks);
-    spp->gc_thres_pcent_high    = 0.95;
     spp->gc_thres_blocks_high    = (int)((1 - spp->gc_thres_pcent_high) * spp->tt_blks);
     spp->enable_gc_delay        = true;
 
@@ -201,10 +201,10 @@ static void namespace_init_params(struct namespace_params *npp, struct ssdparams
     npp->tt_pls     = npp->pls_per_ch   * npp->nchs;
     npp->tt_luns    = npp->luns_per_ch  * npp->nchs;
 
-    npp->gc_thres_pcent         = 0.75;
-    npp->gc_thres_blocks         = (int)((1 - npp->gc_thres_pcent) * npp->tt_blks);
-    npp->gc_thres_pcent_high    = 0.95;
-    npp->gc_thres_blocks_high    = (int)((1 - npp->gc_thres_pcent_high) * npp->tt_blks);
+    npp->gc_thres_pcent         = ssdp->gc_thres_pcent;
+    npp->gc_thres_pcent_high    = ssdp->gc_thres_pcent_high;
+    npp->gc_thres_blocks        = (int)((1 - npp->gc_thres_pcent) * npp->tt_blks);
+    npp->gc_thres_blocks_high   = (int)((1 - npp->gc_thres_pcent_high) * npp->tt_blks);
     npp->enable_gc_delay        = true;
 }
 
@@ -338,7 +338,6 @@ void ns_init(FemuCtrl *n, NvmeNamespace *ns)
     bm->wp_ch = bm->wp_lun = 0;
 
     set_ns_start_index(ns);
-
 
     printf("physical:%ldByte, nch:%d( ", phy_size, ns->np.nchs);
 
@@ -523,7 +522,7 @@ static nand_block *get_free_block_by_inchip_gc(struct NvmeNamespace *ns, struct 
     }
 
     if (!victim_block) {
-        ftl_err("faild victim block select in intra chip gc \r\n");
+        ftl_err("failed victim block select in intra chip gc \r\n");
         return NULL;
     }
 
@@ -679,6 +678,7 @@ static void mark_block_free(struct NvmeNamespace *ns, struct ppa *ppa)
 
     /* 만약 wp인데 free 할 경우 */
     if(lun->wp == ppa->g.blk){
+        printf("wp block free ?? \n");
         lun->wp = get_next_free_block(lun)->ppa.g.blk;
     }
 
@@ -801,21 +801,27 @@ static void free_block(struct NvmeNamespace *ns, struct ppa *ppa)
 static int do_gc(struct NvmeNamespace *ns, bool force)
 {
     struct nand_block *victim_block = NULL;
-    victim_block = select_victim_block(ns, force);
-    if (!victim_block) {
-        printf("ns%d No victim here!!\r\n", ns->id);
+
+    if(pqueue_peek(ns->bm->victim_block_pq) == NULL){
+        printf("victim_block_pq is empty\n");
         return -1;
     }
-    printf("GC nsid:%d, ch:%d, lun:%d, blk:%d\r\n", ns->id, victim_block->ppa.g.ch, victim_block->ppa.g.lun, victim_block->ppa.g.blk);
+
+    victim_block = select_victim_block(ns, force);
+    if (!victim_block) {
+        printf("ns%d No victim here!! vpc:%d ipc:%d\r\n", ns->id, ((struct nand_block *)pqueue_peek(ns->bm->victim_block_pq))->vpc, ((struct nand_block *)pqueue_peek(ns->bm->victim_block_pq))->ipc);
+        return -1;
+    }
+
+    // printf("GC nsid:%d, ch:%d, lun:%d, blk:%d\r\n", ns->id, victim_block->ppa.g.ch, victim_block->ppa.g.lun, victim_block->ppa.g.blk);
     free_block(ns, &victim_block->ppa);
-    printf("done\r\n");
     return 0;
 }
 
 static inline bool should_gc(struct NvmeNamespace *ns)
 {
     // struct block_mgmt *bm = ns->bm;
-    uint64_t free_block_cnt = 0;
+    int free_block_cnt = 0;
     struct ppa ppa;
     ppa.ppa = 0;
     for (int i = 0; i < ns->np.nchs; i++){
@@ -829,6 +835,10 @@ static inline bool should_gc(struct NvmeNamespace *ns)
             }
         }
     }
+    // if( free_block_cnt != ns->np.tt_blks - ns->bm->victim_block_cnt - ns->np.tt_luns)
+    //     printf("free_block_cnt %d %d\n", free_block_cnt, ns->np.tt_blks - ns->bm->victim_block_cnt - ns->np.tt_luns);
+
+    free_block_cnt = ns->np.tt_blks - ns->bm->victim_block_cnt - ns->np.tt_luns;
     return (free_block_cnt <= ns->np.gc_thres_blocks);
 }
 
@@ -904,7 +914,7 @@ static void wl_read_page(NvmeNamespace *ns, struct ppa *ppa)
 }
 
 /* move valid page data (already in DRAM) from victim block to a new page */
-static uint64_t wl_write_page(struct NvmeNamespace *ns1, uint64_t lpn, struct NvmeNamespace *ns2, struct nand_lun *write_lun)
+static uint64_t wl_write_page(struct NvmeNamespace *ns, uint64_t lpn, struct NvmeNamespace *ns2, struct nand_lun *write_lun)
 {
     struct ppa ppa;     // page of write_lun
     uint64_t lat = 0;
@@ -915,23 +925,24 @@ static uint64_t wl_write_page(struct NvmeNamespace *ns1, uint64_t lpn, struct Nv
     ppa.g.blk   = write_lun->wp;
     ppa.g.pg    = write_lun->pl[0].blk[write_lun->wp].wp;
 
-    ftl_assert(valid_lpn(ns1, lpn));
+    ftl_assert(valid_lpn(ns, lpn));
     /* update maptbl */
-    set_maptbl_ent(ns1, lpn, &ppa);
+    set_maptbl_ent(ns, lpn, &ppa);
     /* update rmap */
-    set_rmap_ent(ns1, lpn, &ppa);
+    set_rmap_ent(ns, lpn, &ppa);
 
-    mark_page_valid(ns1, &ppa);
+    mark_page_valid(ns, &ppa);
 
     /* flash write cmd */
     struct nand_cmd wlw;
     wlw.type = WL_IO;
     wlw.cmd = NAND_WRITE;
     wlw.stime = 0;
-    lat = ssd_advance_status(ns1->ssd, &ppa, &wlw);
-
+    lat = ssd_advance_status(ns->ssd, &ppa, &wlw);
+    
     /* advance the write pointer */
-    lun_advance_write_pointer(ns1, write_lun);
+    write_lun->pl[0].blk[write_lun->wp].swapped = true;
+    lun_advance_write_pointer(ns, write_lun);
     return lat;
 }
 
@@ -944,7 +955,7 @@ static int read_one_block(struct NvmeNamespace *ns, struct nand_block *blk, uint
     if( blk == NULL ){
         return 0;
     }
-    
+
     ppa.ppa = blk->ppa.ppa;
     for (int pg = 0; pg < npp->pgs_per_blk; pg++) {
         ppa.g.pg = pg;
@@ -953,14 +964,14 @@ static int read_one_block(struct NvmeNamespace *ns, struct nand_block *blk, uint
             wl_read_page(ns, &ppa);
             mark_page_invalid(ns, &ppa);
         }
-        if( start+count == len )    // if len < 0, read all pages
+        if( start+count == len )    // if len <= -1, read all pages
             break;
     }
 
-    // finish block read
-    if(ppa.g.pg >= npp->pgs_per_blk-1){
-        blk->swapped = true;
-    }
+    // // finish block read
+    // if(ppa.g.pg >= npp->pgs_per_blk-1){
+    //     blk->swapped = true;
+    // }
 
     return count;
 }
@@ -997,11 +1008,11 @@ static void swap_block( struct NvmeNamespace *ns1, struct nand_lun *lun1, struct
     }
 
     /* move counterpart chip */
-    for (int lpn_i = 0; lpn_i < lpn_idx1; lpn_i++){
-        wl_write_page(ns1, lpn_buffer1[lpn_i], ns2, lun2);
+    for (int i = 0; i < lpn_idx1; i++){
+        wl_write_page(ns1, lpn_buffer1[i], ns2, lun2);
     }
-    for (int lpn_i = 0; lpn_i < lpn_idx2; lpn_i++){
-        wl_write_page(ns2, lpn_buffer2[lpn_i], ns1, lun1);
+    for (int i = 0; i < lpn_idx2; i++){
+        wl_write_page(ns2, lpn_buffer2[i], ns1, lun1);
     }
 
     // wait for all page write
@@ -1085,162 +1096,6 @@ static void *swap_chip(void *args)
     }
     return NULL;
 }
-
-// static void *swap_chip_adaptive(void *args)
-// {
-//     /* parsing args */
-//     struct chip_swap_args *swap_args = args;
-//     struct NvmeNamespace *ns1   = swap_args->ns1;
-//     struct NvmeNamespace *ns2   = swap_args->ns2;
-//     struct ppa *ppa1            = &swap_args->ppa1;
-//     struct ppa *ppa2            = &swap_args->ppa2;
-
-//     /* variables */
-//     struct ssd *ssd = ns1->ssd;
-//     struct namespace_params *npp1 = &ns1->np;
-//     struct namespace_params *npp2 = &ns2->np;
-//     struct nand_lun *lun1 = get_lun(ssd, ppa1);
-//     struct nand_lun *lun2 = get_lun(ssd, ppa2);
-//     struct nand_block *blk1;
-//     struct nand_block *blk2;
-//     int len = 0;
-//     uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
-
-//     int moved = 0;
-//     int loop = 0;
-
-//     /* Move write point block first */
-//     blk1 = &lun1->pl[0].blk[lun1->wp];  
-//     blk2 = &lun2->pl[0].blk[lun2->wp];
-//     swap_block(ns1, lun1, ppa1, ns2, lun2, ppa2);
-//     blk1->swapped = true;
-//     blk2->swapped = true;
-
-//     do {
-//         now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
-//     } while (now < lun1->next_lun_avail_time || now < lun2->next_lun_avail_time);
-    
-//     /* Move rest full block */
-//     while( 1 ) {
-//         /* block swap */
-//         uint64_t *lpn_buffer1, *lpn_buffer2;
-//         int lpn_idx1 = 0, lpn_idx2 = 0;
-//         lpn_buffer1 = g_malloc0(sizeof(uint64_t) * npp1->pgs_per_blk);
-//         lpn_buffer2 = g_malloc0(sizeof(uint64_t) * npp2->pgs_per_blk);
-
-//         now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
-//         len = 0;
-
-//         blk1 = get_next_full_block(ns1, lun1, 0);
-//         blk2 = get_next_full_block(ns2, lun2, 0);
-//         if( blk1 == NULL && blk2 == NULL ){
-//             break;
-//         }
-
-//         if( blk1 != NULL )
-//             len = blk1->vpc;
-//         if( blk2 != NULL )
-//             len = len > blk2->vpc ? len : blk2->vpc;
-        
-//         printf("len %d\n", len);
-//         moved += len;
-
-//         while( blk1 != NULL ){
-//             ppa1->g.blk = blk1->ppa.g.blk;
-//             int count = read_one_block(ns1, ppa1, lpn_buffer1, lpn_idx1, len);
-//             lpn_idx1 += count;
-//             printf("[1]read %d pages in block %d\n", count, ppa1->g.blk);
-//             if( lpn_idx1 < len )
-//             {
-//                 blk1 = get_next_full_block(ns1, lun1, 0);
-//             }else{
-//                 break;
-//             }
-//         }
-
-//         while( blk2 != NULL ){
-//             ppa2->g.blk = blk2->ppa.g.blk;
-//             int count = read_one_block(ns2, ppa2, lpn_buffer2, lpn_idx2, len);
-//             lpn_idx2 += count;
-//             printf("[2]read %d pages in block %d\n", count, ppa2->g.blk);
-//             if( lpn_idx2 < len )
-//             {
-//                 blk2 = get_next_full_block(ns2, lun2, 0);
-//             }else{
-//                 break;
-//             }
-//         }
-
-//         /* move to counterpart chip */
-//         if( blk1 != NULL ){  
-//             for (int lpn_i = 0; lpn_i < lpn_idx1; lpn_i++) {
-//                 wl_write_page(ns1, lpn_buffer1[lpn_i], ns2, lun2);
-//             }
-//         }
-//         if( blk2 != NULL ){  
-//             for (int lpn_i = 0; lpn_i < lpn_idx2; lpn_i++) {
-//                 wl_write_page(ns2, lpn_buffer2[lpn_i], ns1, lun1);
-//             }
-//         }
-
-//         g_free(lpn_buffer1);
-//         g_free(lpn_buffer2);
-
-//         printf("[ ]move %d blocks %d %d\n", len, lpn_idx1, lpn_idx2);
-//         /* erase each block */
-//         struct nand_cmd wle;
-//         wle.type = WL_IO;
-//         wle.cmd = NAND_ERASE;
-//         wle.stime = 0;
-//         blk1 = get_next_invalid_block(ns1, lun1, 0);
-//         blk2 = get_next_invalid_block(ns2, lun2, 0);
-//         if( blk1 != NULL ){
-//             mark_block_free(ns1, &blk1->ppa);
-//             ssd_advance_status(ssd, &blk1->ppa, &wle);
-//             blk1->swapped = true;
-
-//             printf("[1]erase1 block %d\n", blk1->ppa.g.blk);
-//         }
-//         if( blk2 != NULL ){
-//             mark_block_free(ns2, &blk2->ppa);
-//             ssd_advance_status(ssd, &blk2->ppa, &wle);
-//             blk2->swapped = true;
-
-//             printf("[2]erase2 block %d\n", blk2->ppa.g.blk);
-//         }
-
-//         // wait block IO 
-//         do {
-//             now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
-//         }while(now < lun1->next_lun_avail_time || now < lun2->next_lun_avail_time);
-
-//         loop++;
-//     }
-
-//      /* erase rest block */
-//     do{
-//         struct nand_cmd wle;
-//         wle.type = WL_IO;
-//         wle.cmd = NAND_ERASE;
-//         wle.stime = 0;
-//         blk1 = get_next_invalid_block(ns1, lun1, 0);
-//         blk2 = get_next_invalid_block(ns2, lun2, 0);
-//         if( blk1 != NULL ){
-//             mark_block_free(ns1, &blk1->ppa);
-//             ssd_advance_status(ssd, &blk1->ppa, &wle);
-//             blk1->swapped = true;
-//         }
-//         if( blk2 != NULL ){
-//             mark_block_free(ns2, &blk2->ppa);
-//             ssd_advance_status(ssd, &blk2->ppa, &wle);
-//             blk2->swapped = true;
-//         }
-//     }while(blk1 != NULL || blk2 != NULL);
-
-//     printf("moved %d pages in %d loop\n", moved, loop);
-
-//     return NULL;
-// }
 
 static void *ch_swap(void *args)
 {    
@@ -1362,9 +1217,9 @@ static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
         ppa = get_maptbl_ent(ns, lpn);
         if (!mapped_ppa(&ppa) || !valid_ppa(ns, &ppa)) {
-            //printf("%s,lpn(%" PRId64 ") not mapped to valid ppa\n", ssd->ssdname, lpn);
-            //printf("Invalid ppa,ch:%d,lun:%d,blk:%d,pl:%d,pg:%d,sec:%d\n",
-            //ppa.g.ch, ppa.g.lun, ppa.g.blk, ppa.g.pl, ppa.g.pg, ppa.g.sec);
+            // printf("%s,lpn(%" PRId64 ") not mapped to valid ppa\n", ssd->ssdname, lpn);
+            // printf("Invalid ppa,ch:%d,lun:%d,blk:%d,pl:%d,pg:%d,sec:%d\n",
+            // ppa.g.ch, ppa.g.lun, ppa.g.blk, ppa.g.pl, ppa.g.pg, ppa.g.sec);
             continue;
         }        
         struct nand_cmd srd;
@@ -1403,7 +1258,7 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
         if (r == -1)
             break;
     }
-
+        
     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
         ppa = get_maptbl_ent(ns, lpn);
         if (mapped_ppa(&ppa)) {
@@ -1460,6 +1315,7 @@ static void *ftl_thread(void *arg)
         for (i = 1; i <= n->nr_pollers; i++) {
             if (!ssd->to_ftl[i] || !femu_ring_count(ssd->to_ftl[i]))
                 continue;
+
             rc = femu_ring_dequeue(ssd->to_ftl[i], (void *)&req, 1);
             if (rc != 1) {
                 printf("FEMU: FTL to_ftl dequeue failed\n");
@@ -1484,7 +1340,6 @@ static void *ftl_thread(void *arg)
 
             req->reqlat = lat;
             req->expire_time += lat;
-
             rc = femu_ring_enqueue(ssd->to_poller[i], (void *)&req, 1);
             if (rc != 1) {
                 ftl_err("FTL to_poller enqueue failed\n");
@@ -1497,7 +1352,7 @@ static void *ftl_thread(void *arg)
             //         do_gc(&n->namespaces[i], false);
             //     }
             // }
-
+        
             if (should_gc(req->ns)) {
                 do_gc(req->ns, false);
             }
@@ -1529,7 +1384,6 @@ void monitoring_to_file(void *arg)
     FILE *fp;
     fp = fopen("monitoring.txt", "w");
 
-
     for( int i = 0; i < n->num_namespaces; i++ ){
         struct NvmeNamespace *ns = &n->namespaces[i];
         int ipc = pqueue_peek(ns->bm->victim_block_pq) != NULL ? ((nand_block *)pqueue_peek(ns->bm->victim_block_pq))->ipc : 0;
@@ -1546,10 +1400,15 @@ void monitoring_to_file(void *arg)
             for( int blk = 0; blk < n->ssd->sp.blks_per_pl; blk++ ){
                 vpc += n->ssd->ch[ch].lun[lun].pl[0].blk[blk].vpc;
             }
-            fprintf(fp, "%2dch %dchip freeblock %d  total_vpc %d vpc", ch, lun, n->ssd->ch[ch].lun[lun].pl[0].free_block_cnt, vpc);
+            fprintf(fp, "%2dch %dchip free %-3d tot_vp %-5d vpc ", ch, lun, n->ssd->ch[ch].lun[lun].pl[0].free_block_cnt, vpc);
 
             for( int blk = 0; blk < n->ssd->sp.blks_per_pl; blk++ ){
-                fprintf(fp, " %3d", n->ssd->ch[ch].lun[lun].pl[0].blk[blk].vpc);
+                if(n->ssd->ch[ch].lun[lun].pl[0].blk[blk].state == BLOCK_FREE)
+                    fprintf(fp, "  - ");
+                else if(n->ssd->ch[ch].lun[lun].pl[0].blk[blk].state == BLOCK_OPEN)
+                    fprintf(fp, "%3d<", n->ssd->ch[ch].lun[lun].pl[0].blk[blk].vpc);
+                else
+                    fprintf(fp, "%3d ", n->ssd->ch[ch].lun[lun].pl[0].blk[blk].vpc);
             }
             fprintf(fp, "\n");
         }

@@ -4,6 +4,9 @@
         "*.code": "c",
         "pqueue.h": "c",
         "*.idef": "c",
-        "*.def": "c"
+        "*.def": "c",
+        "ios": "c",
+        "locale": "c",
+        "random": "c"
     }
 }

@@ -1074,7 +1074,7 @@ struct namespace_params {
     int blks_per_pl;  /* # of blocks per plane */
     int pls_per_lun;  /* # of planes per LUN (Die) */
     int luns_per_ch;  /* # of LUNs per channel */
-    int nchs;         /* # of channels in the SSD */
+    int nchs;         /* # of channels in the namespace */
 
     double gc_thres_pcent;
     int gc_thres_blocks;
@@ -1087,16 +1087,16 @@ struct namespace_params {
     int secs_per_pl;  /* # of sectors per plane */
     int secs_per_lun; /* # of sectors per LUN */
     int secs_per_ch;  /* # of sectors per channel */
-    int tt_secs;      /* # of sectors in the SSD */
+    int tt_secs;      /* # of sectors in the namespace */
 
     int pgs_per_pl;   /* # of pages per plane */
     int pgs_per_lun;  /* # of pages per LUN (Die) */
     int pgs_per_ch;   /* # of pages per channel */
-    int tt_pgs;       /* total # of pages in the SSD */
+    int tt_pgs;       /* total # of pages in the namespace */
 
     int blks_per_lun; /* # of blocks per LUN */
     int blks_per_ch;  /* # of blocks per channel */
-    int tt_blks;      /* total # of blocks in the SSD */
+    int tt_blks;      /* total # of blocks in the namespace */
 
     int secs_per_line;
     int pgs_per_line;
@@ -1104,9 +1104,9 @@ struct namespace_params {
     int tt_lines;
 
     int pls_per_ch;   /* # of planes per channel */
-    int tt_pls;       /* total # of planes in the SSD */
+    int tt_pls;       /* total # of planes in the namespace */
 
-    int tt_luns;      /* total # of LUNs in the SSD */
+    int tt_luns;      /* total # of LUNs in the namespace */
 };
 
 // typedef struct line {

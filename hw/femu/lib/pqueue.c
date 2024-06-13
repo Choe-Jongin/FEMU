@@ -34,9 +34,7 @@
 #define right(i)  (((i) << 1) + 1)
 #define parent(i) ((i) >> 1)
 
-int mutex_change = 0;
 int mutex_remove = 0;
-int mutex_pop = 0;
 
 pqueue_t *pqueue_init(size_t n, pqueue_cmp_pri_f cmppri, pqueue_get_pri_f getpri,
         pqueue_set_pri_f setpri, pqueue_get_pos_f getpos, pqueue_set_pos_f setpos)
@@ -150,9 +148,6 @@ int pqueue_insert(pqueue_t *q, void *d)
 
 void pqueue_change_priority(pqueue_t *q, pqueue_pri_t new_pri, void *d)
 {
-    while(mutex_change) ;
-    mutex_change = 1;
-
     size_t posn;
     pqueue_pri_t old_pri = q->getpri(d);
 
@@ -162,29 +157,35 @@ void pqueue_change_priority(pqueue_t *q, pqueue_pri_t new_pri, void *d)
         bubble_up(q, posn);
     else
         percolate_down(q, posn);
-
-    mutex_change= 0;
 }
 
 int pqueue_remove(pqueue_t *q, void *d)
 {
-    while(mutex_remove) ;
-    mutex_remove = 1;
-    size_t posn = q->getpos(d);
-    q->d[posn] = q->d[--q->size];
-    if (q->cmppri(q->getpri(d), q->getpri(q->d[posn])))
-        bubble_up(q, posn);
-    else
-        percolate_down(q, posn);
+    while(mutex_remove) ; // 동기화 잠금
+    mutex_remove = 1;     // 동기화 잠금 설정
 
-    mutex_remove = 0;
-    return 0;
+    size_t posn = q->getpos(d); // 제거할 요소의 위치 찾기
+    
+    if (posn >= q->size) {
+        fprintf(stderr, "Error: Invalid position %zu\n", posn);
+        mutex_remove = 0;
+        return 1; // 오류 코드 반환
+    }
+    
+    q->d[posn] = q->d[--q->size]; // 마지막 요소를 제거할 위치로 이동
+
+    // 힙 속성을 유지하기 위해 재정렬
+    if (q->cmppri(q->getpri(d), q->getpri(q->d[posn])))
+        bubble_up(q, posn); // 필요 시 요소를 위로 이동
+    else
+        percolate_down(q, posn); // 필요 시 요소를 아래로 이동
+
+    mutex_remove = 0; // 동기화 잠금 해제
+    return 0; // 성공적으로 제거됨을 반환
 }
 
 void *pqueue_pop(pqueue_t *q)
 {
-    while(mutex_pop) ;
-    mutex_pop = 1;
     void *head;
 
     if (!q || q->size == 1)
@@ -194,7 +195,6 @@ void *pqueue_pop(pqueue_t *q)
     q->d[1] = q->d[--q->size];
     percolate_down(q, 1);
 
-    mutex_pop = 0;
     return head;
 }
 
