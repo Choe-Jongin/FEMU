@@ -161,6 +161,8 @@ static void nvme_process_cq_cpl(void *arg, int index_poller)
         pqueue_pop(pq);
         processed++;
         n->nr_tt_ios++;
+        req->ns->waiting_io--;
+
         if (now - req->expire_time >= 20000) {
             n->nr_tt_late_ios++;
             if (n->print_log) {
@@ -271,7 +273,9 @@ uint16_t nvme_rw(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req)
     req->status = NVME_SUCCESS;
     req->nlb = nlb;
 
-    ret = backend_rw(n->mbe, &req->qsg, &data_offset, req->is_write);
+    /* Specify Namespace */
+    ret = backend_rw_namespace(n->mbe, &req->qsg, &data_offset, req->is_write, ns->id);
+    // ret = backend_rw(n->mbe, &req->qsg, &data_offset, req->is_write);
     if (!ret) {
         return NVME_SUCCESS;
     }
@@ -368,12 +372,12 @@ static uint16_t nvme_compare(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
             return NVME_CMP_FAILURE;
         }
         offset += len;
+
         free(tmp[0]);
         free(tmp[1]);
     }
 
     qemu_sglist_destroy(&req->qsg);
-
     return NVME_SUCCESS;
 }
 
@@ -428,6 +432,7 @@ static uint16_t nvme_io_cmd(FemuCtrl *n, NvmeCmd *cmd, NvmeRequest *req)
     }
 
     req->ns = ns = &n->namespaces[nsid - 1];
+    req->ns->waiting_io++;
 
     switch (cmd->opcode) {
     case NVME_CMD_FLUSH:

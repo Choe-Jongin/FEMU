@@ -93,7 +93,7 @@ static uint16_t bb_admin_cmd(FemuCtrl *n, NvmeCmd *cmd)
     switch (cmd->opcode) {
     case NVME_ADM_CMD_FEMU_FLIP:
         bb_flip(n, cmd);
-        return NVME_SUCCESS;
+        return NVME_SUCCESS;        
     default:
         return NVME_INVALID_OPCODE | NVME_DNR;
     }
