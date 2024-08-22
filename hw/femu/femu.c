@@ -357,31 +357,30 @@ static int nvme_init_namespace(FemuCtrl *n, NvmeNamespace *ns, Error **errp)
     nvme_ns_init_identify(n, id_ns);
 
     lba_index = NVME_ID_NS_FLBAS_INDEX(ns->id_ns.flbas);
-    num_blks = n->ns_size / ((1 << id_ns->lbaf[lba_index].lbads));
+    num_blks = ns->size / ((1 << id_ns->lbaf[lba_index].lbads));
     id_ns->nuse = id_ns->ncap = id_ns->nsze = cpu_to_le64(num_blks);
 
     n->csi = NVME_CSI_NVM;
     ns->ctrl = n;
     ns->ns_blks = ns_blks(ns, lba_index);
     ns->util = bitmap_new(num_blks);
-    ns->uncorrectable = bitmap_new(num_blks);
+    ns->uncorrectable = bitmap_new(num_blks); 
 
+    //CASTLAB :
+    ns->waiting_io = 0;
     return 0;
 }
 
-static int nvme_init_namespaces(FemuCtrl *n, Error **errp)
+static int nvme_init_namespaces(FemuCtrl *n, Error **errp, uint64_t size)
 {
     int i;
 
-    /* FIXME: FEMU only supports 1 namesapce now */
-    assert(n->num_namespaces == 1);
-
     for (i = 0; i < n->num_namespaces; i++) {
         NvmeNamespace *ns = &n->namespaces[i];
-        ns->size = n->ns_size;
-        ns->start_block = i * n->ns_size >> BDRV_SECTOR_BITS;
+        ns->size = size;
+        ns->start_block = i * ns->size >> BDRV_SECTOR_BITS;
         ns->id = i + 1;
-
+        init_dram_backend_logical_space(&n->mbe, i, ns->size);
         if (nvme_init_namespace(n, ns, errp)) {
             return 1;
         }
@@ -414,10 +413,11 @@ static void nvme_init_ctrl(FemuCtrl *n)
     id->frmw         = 7 << 1 | 1;
     id->lpa          = NVME_LPA_NS_SMART | NVME_LPA_CSE | NVME_LPA_EXTENDED;
     id->elpe         = n->elpe;
-    id->npss         = 0;
     id->sqes         = (n->max_sqes << 4) | 0x6;
     id->cqes         = (n->max_cqes << 4) | 0x4;
-    id->nn           = cpu_to_le32(n->num_namespaces);
+    /* nn is a maximum number of namespace, not current number of namespace */
+    // id->nn           = cpu_to_le32(n->num_namespaces);   
+    id->nn           = NVME_MAX_NUM_NAMESPACES;
     id->oncs         = cpu_to_le16(n->oncs);
     subnqn           = g_strdup_printf("nqn.2019-08.org.qemu:%s", n->serial);
     strpadcpy((char *)id->subnqn, sizeof(id->subnqn), subnqn, '\0');
@@ -542,8 +542,7 @@ static void femu_realize(PCIDevice *pci_dev, Error **errp)
     }
 
     bs_size = ((int64_t)n->memsz) * 1024 * 1024;
-
-    init_dram_backend(&n->mbe, bs_size);
+    init_dram_backend(&n->mbe, bs_size, n->num_namespaces);
     n->mbe->femu_mode = n->femu_mode;
 
     n->completed = 0;
@@ -554,20 +553,21 @@ static void femu_realize(PCIDevice *pci_dev, Error **errp)
     /* Coperd: [1..nr_io_queues] are used as IO queues */
     n->sq = g_malloc0(sizeof(*n->sq) * (n->nr_io_queues + 1));
     n->cq = g_malloc0(sizeof(*n->cq) * (n->nr_io_queues + 1));
-    n->namespaces = g_malloc0(sizeof(*n->namespaces) * n->num_namespaces);
+    n->namespaces = g_malloc0(sizeof(*n->namespaces) * NVME_MAX_NUM_NAMESPACES);
     n->elpes = g_malloc0(sizeof(*n->elpes) * (n->elpe + 1));
     n->aer_reqs = g_malloc0(sizeof(*n->aer_reqs) * (n->aerl + 1));
     n->features.int_vector_config = g_malloc0(sizeof(*n->features.int_vector_config) * (n->nr_io_queues + 1));
 
     nvme_init_pci(n);
     nvme_init_ctrl(n);
-    nvme_init_namespaces(n, errp);
+    nvme_init_namespaces(n, errp, n->ns_size);
 
     nvme_register_extensions(n);
-
+    
     if (n->ext_ops.init) {
         n->ext_ops.init(n, errp);
     }
+    usleep(1000*1000);
 }
 
 static void nvme_destroy_poller(FemuCtrl *n)
@@ -620,7 +620,8 @@ static Property femu_props[] = {
     DEFINE_PROP_UINT32("devsz_mb", FemuCtrl, memsz, 1024), /* in MB */
     DEFINE_PROP_UINT32("namespaces", FemuCtrl, num_namespaces, 1),
     DEFINE_PROP_UINT32("queues", FemuCtrl, nr_io_queues, 8),
-    DEFINE_PROP_UINT32("entries", FemuCtrl, max_q_ents, 0x7ff),
+    // DEFINE_PROP_UINT32("entries", FemuCtrl, max_q_ents, 0x7ff),
+    DEFINE_PROP_UINT32("entries", FemuCtrl, max_q_ents, 0xffff),
     DEFINE_PROP_UINT8("multipoller_enabled", FemuCtrl, multipoller_enabled, 0),
     DEFINE_PROP_UINT8("max_cqes", FemuCtrl, max_cqes, 0x4),
     DEFINE_PROP_UINT8("max_sqes", FemuCtrl, max_sqes, 0x6),

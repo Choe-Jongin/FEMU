@@ -18,6 +18,9 @@
 #include "nand/nand.h"
 #include "timing-model/timing.h"
 
+#include "bbssd/statistic.h"
+
+
 #define NVME_ID_NS_LBADS(ns)                                                  \
     ((ns)->id_ns.lbaf[NVME_ID_NS_FLBAS_INDEX((ns)->id_ns.flbas)].lbads)
 
@@ -76,7 +79,7 @@ enum NvmeCapMask {
 #define NVME_MAX_QS PCI_MSIX_FLAGS_QSIZE
 #define NVME_MAX_QUEUE_ENTRIES  0xffff
 #define NVME_MAX_STRIDE         12
-#define NVME_MAX_NUM_NAMESPACES 256
+#define NVME_MAX_NUM_NAMESPACES 32 // must be 256
 #define NVME_MAX_QUEUE_ES       0xf
 #define NVME_MIN_CQUEUE_ES      0x4
 #define NVME_MIN_SQUEUE_ES      0x6
@@ -328,6 +331,10 @@ enum NvmeAdminCommands {
     NVME_ADM_CMD_SET_DB_MEMORY  = 0x7c,
     NVME_ADM_CMD_FEMU_DEBUG     = 0xee,
     NVME_ADM_CMD_FEMU_FLIP      = 0xef,
+
+    NVME_ADM_CMD_NS_MANAGE      = 0x0d,
+    NVME_ADM_CMD_NS_ATTACHMENT  = 0x15,
+    NVME_ADM_CMD_CAPA_MANAGE    = 0x20,
 };
 
 enum NvmeIoCommands {
@@ -1059,6 +1066,81 @@ typedef struct Oc12Ctrl Oc12Ctrl;
 typedef struct NvmeIdNsZoned NvmeIdNsZoned;
 typedef struct NvmeZone NvmeZone;
 
+/* For multi Namespaces*/
+struct namespace_params {
+    int secsz;        /* sector size in bytes */
+    int secs_per_pg;  /* # of sectors per page */
+    int pgs_per_blk;  /* # of NAND pages per block */
+    int blks_per_pl;  /* # of blocks per plane */
+    int pls_per_lun;  /* # of planes per LUN (Die) */
+    int luns_per_ch;  /* # of LUNs per channel */
+    int nchs;         /* # of channels in the namespace */
+
+    double gc_thres_pcent;
+    int gc_thres_blocks;
+    double gc_thres_pcent_high;
+    int gc_thres_blocks_high;
+    bool enable_gc_delay;
+
+    /* below are all calculated values */
+    int secs_per_blk; /* # of sectors per block */
+    int secs_per_pl;  /* # of sectors per plane */
+    int secs_per_lun; /* # of sectors per LUN */
+    int secs_per_ch;  /* # of sectors per channel */
+    int tt_secs;      /* # of sectors in the namespace */
+
+    int pgs_per_pl;   /* # of pages per plane */
+    int pgs_per_lun;  /* # of pages per LUN (Die) */
+    int pgs_per_ch;   /* # of pages per channel */
+    int tt_pgs;       /* total # of pages in the namespace */
+
+    int blks_per_lun; /* # of blocks per LUN */
+    int blks_per_ch;  /* # of blocks per channel */
+    int tt_blks;      /* total # of blocks in the namespace */
+
+    int secs_per_line;
+    int pgs_per_line;
+    int blks_per_line;
+    int tt_lines;
+
+    int pls_per_ch;   /* # of planes per channel */
+    int tt_pls;       /* total # of planes in the namespace */
+
+    int tt_luns;      /* total # of LUNs in the namespace */
+};
+
+// typedef struct line {
+//     int id;  /* line id, the same as corresponding block id */
+//     int ipc; /* invalid page count in this line */
+//     int vpc; /* valid page count in this line */
+//     QTAILQ_ENTRY(line) entry; /* in either {free,victim,full} list */
+//     /* position in the priority queue for victim lines */
+//     size_t                  pos;
+// } line;
+
+// /* wp: record next write addr */
+// struct write_pointer {
+//     struct line *curline;
+//     int ch;
+//     int lun;
+//     int pg;
+//     int blk;
+//     int pl;
+// };
+
+// struct line_mgmt {
+//     struct line *lines;
+//     /* free line list, we only need to maintain a list of blk numbers */
+//     QTAILQ_HEAD(free_line_list, line) free_line_list;
+//     pqueue_t *victim_line_pq;
+//     // QTAILQ_HEAD(victim_line_list, line) victim_line_list;
+//     QTAILQ_HEAD(full_line_list, line) full_line_list;
+//     int tt_lines;
+//     int free_line_cnt;
+//     int victim_line_cnt;
+//     int full_line_cnt;
+// };
+
 typedef struct NvmeNamespace {
     struct FemuCtrl *ctrl;
     NvmeIdNs        id_ns;
@@ -1082,6 +1164,16 @@ typedef struct NvmeNamespace {
         uint64_t data;
         uint64_t meta;
     } blk;
+
+    /* for multi namespaces(only black-box) */
+    struct namespace_params np;
+    void *wp;   // write_pointer
+    struct block_mgmt *bm;   // block_mgmt
+    struct ssd *ssd;
+    int start_lpn;
+    int *ch_list;
+    struct statistic *statistic;
+    int waiting_io;
 
     void *state;
 } NvmeNamespace;

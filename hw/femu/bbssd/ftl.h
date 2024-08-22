@@ -20,6 +20,7 @@ enum {
 enum {
     USER_IO = 0,
     GC_IO = 1,
+    WL_IO = 2,
 };
 
 enum {
@@ -29,8 +30,20 @@ enum {
 
     PG_FREE = 0,
     PG_INVALID = 1,
-    PG_VALID = 2
+    PG_VALID = 2,
 };
+
+enum {
+    BLOCK_FREE = 0,
+    BLOCK_OPEN = 1,
+    BLOCK_FULL = 2,
+};
+
+enum {
+    OFFSET = 0,
+    SORTED = 1,
+};
+
 
 enum {
     FEMU_ENABLE_GC_DELAY = 1,
@@ -77,18 +90,29 @@ struct nand_page {
     int status;
 };
 
-struct nand_block {
+typedef struct nand_block {
     struct nand_page *pg;
     int npgs;
     int ipc; /* invalid page count */
     int vpc; /* valid page count */
     int erase_cnt;
     int wp; /* current write pointer */
-};
+    int state;
+
+    QTAILQ_ENTRY(nand_block) entry;
+    size_t pos;
+
+    struct ppa ppa;
+}nand_block;
 
 struct nand_plane {
     struct nand_block *blk;
     int nblks;
+
+    QTAILQ_HEAD(free_block_list, nand_block) free_block_list;
+    int free_block_cnt;
+
+    struct ppa ppa;
 };
 
 struct nand_lun {
@@ -97,6 +121,11 @@ struct nand_lun {
     uint64_t next_lun_avail_time;
     bool busy;
     uint64_t gc_endtime;
+
+    int wp; /* current write block pointer */
+    bool chip_gc_now;
+
+    struct ppa ppa;
 };
 
 struct ssd_channel {
@@ -105,6 +134,7 @@ struct ssd_channel {
     uint64_t next_ch_avail_time;
     bool busy;
     uint64_t gc_endtime;
+    struct ppa ppa;
 };
 
 struct ssdparams {
@@ -124,9 +154,9 @@ struct ssdparams {
                        */
 
     double gc_thres_pcent;
-    int gc_thres_lines;
+    int gc_thres_blocks;
     double gc_thres_pcent_high;
-    int gc_thres_lines_high;
+    int gc_thres_blocks_high;
     bool enable_gc_delay;
 
     /* below are all calculated values */
@@ -145,47 +175,54 @@ struct ssdparams {
     int blks_per_ch;  /* # of blocks per channel */
     int tt_blks;      /* total # of blocks in the SSD */
 
-    int secs_per_line;
-    int pgs_per_line;
-    int blks_per_line;
-    int tt_lines;
-
     int pls_per_ch;   /* # of planes per channel */
     int tt_pls;       /* total # of planes in the SSD */
 
     int tt_luns;      /* total # of LUNs in the SSD */
 };
 
-typedef struct line {
-    int id;  /* line id, the same as corresponding block id */
-    int ipc; /* invalid page count in this line */
-    int vpc; /* valid page count in this line */
-    QTAILQ_ENTRY(line) entry; /* in either {free,victim,full} list */
-    /* position in the priority queue for victim lines */
-    size_t                  pos;
-} line;
+// typedef struct line {
+//     int id;  /* line id, the same as corresponding block id */
+//     int ipc; /* invalid page count in this line */
+//     int vpc; /* valid page count in this line */
+//     QTAILQ_ENTRY(line) entry; /* in either {free,victim,full} list */
+//     /* position in the priority queue for victim lines */
+//     size_t                  pos;
+// } line;
 
 /* wp: record next write addr */
-struct write_pointer {
-    struct line *curline;
-    int ch;
-    int lun;
-    int pg;
-    int blk;
-    int pl;
-};
+// struct write_pointer {
+//     struct nand_block *cur_block;
+//     int ch;
+//     int lun;
+//     int pg;
+//     int blk;
+//     int pl;
+// };
 
-struct line_mgmt {
-    struct line *lines;
-    /* free line list, we only need to maintain a list of blk numbers */
-    QTAILQ_HEAD(free_line_list, line) free_line_list;
-    pqueue_t *victim_line_pq;
-    //QTAILQ_HEAD(victim_line_list, line) victim_line_list;
-    QTAILQ_HEAD(full_line_list, line) full_line_list;
-    int tt_lines;
-    int free_line_cnt;
-    int victim_line_cnt;
-    int full_line_cnt;
+// struct line_mgmt {
+//     struct line *lines;
+//     /* free line list, we only need to maintain a list of blk numbers */
+//     QTAILQ_HEAD(free_line_list, line) free_line_list;
+//     pqueue_t *victim_line_pq;
+//     //QTAILQ_HEAD(victim_line_list, line) victim_line_list;
+//     QTAILQ_HEAD(full_line_list, line) full_line_list;
+//     int tt_lines;
+//     int free_line_cnt;
+//     int victim_line_cnt;
+//     int full_line_cnt;
+// };
+
+struct block_mgmt {
+    struct nand_block *blks;
+    int tt_blks;
+
+    // write pointer
+    int wp_ch;
+    int wp_lun;
+
+    pqueue_t *victim_block_pq;
+    int victim_block_cnt;
 };
 
 struct nand_cmd {
@@ -194,23 +231,40 @@ struct nand_cmd {
     int64_t stime; /* Coperd: request arrival time */
 };
 
+struct chip_swap_args{
+    struct NvmeNamespace *ns1;
+    struct NvmeNamespace *ns2;
+    struct ppa ppa1;
+    struct ppa ppa2;
+};
+struct ch_swap_args{
+    struct NvmeNamespace *ns1;
+    struct NvmeNamespace *ns2;
+    int ch1;
+    int ch2;
+};
 struct ssd {
     char *ssdname;
     struct ssdparams sp;
     struct ssd_channel *ch;
     struct ppa *maptbl; /* page level mapping table */
     uint64_t *rmap;     /* reverse mapptbl, assume it's stored in OOB */
-    struct write_pointer wp;
-    struct line_mgmt lm;
+    // struct write_pointer wp;
+    // struct line_mgmt lm;
 
     /* lockless ring for communication with NVMe IO thread */
     struct rte_ring **to_ftl;
     struct rte_ring **to_poller;
     bool *dataplane_started_ptr;
     QemuThread ftl_thread;
-};
+    QemuThread ch_swap_thread;
+    struct ch_swap_args args;
 
+    struct statistic *statistics;   // statistic list
+};
+void ns_init(FemuCtrl *n, NvmeNamespace *ns);
 void ssd_init(FemuCtrl *n);
+void do_swap(FemuCtrl *n);
 
 #ifdef FEMU_DEBUG_FTL
 #define ftl_debug(fmt, ...) \
