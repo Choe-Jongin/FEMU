@@ -160,30 +160,30 @@ static void ssd_init_params(struct ssdparams *spp, FemuCtrl *n)
     check_params(spp);
 }
  
-static void namespace_init_params(struct namespace_params *npp, struct ssdparams *ssdp, uint64_t phy_size)
+static void namespace_init_params(struct namespace_params *npp, struct ssdparams *spp, uint64_t phy_size)
 {
-    npp->secsz = ssdp->secsz;
-    npp->secs_per_pg = ssdp->secs_per_pg;
-    npp->pgs_per_blk = ssdp->pgs_per_blk;
-    npp->blks_per_pl = ssdp->blks_per_pl;
-    npp->pls_per_lun = ssdp->pls_per_lun;
-    npp->luns_per_ch = ssdp->luns_per_ch;
-    npp->nchs = phy_size/(ssdp->secs_per_ch*ssdp->secsz);   
+    npp->secsz = spp->secsz;
+    npp->nchs = phy_size/((uint64_t)spp->secs_per_ch*(uint64_t)spp->secsz); 
+    npp->secs_per_pg = spp->secs_per_pg;
+    npp->pgs_per_blk = spp->pgs_per_blk;
+    npp->blks_per_pl = spp->blks_per_pl;
+    npp->pls_per_lun = spp->pls_per_lun;
+    npp->luns_per_ch = spp->luns_per_ch;  
 
     /* calculated values */
-    npp->secs_per_blk   = ssdp->secs_per_blk;
-    npp->secs_per_pl    = ssdp->secs_per_pl;
-    npp->secs_per_lun   = ssdp->secs_per_lun;
-    npp->secs_per_ch    = ssdp->secs_per_ch;
+    npp->secs_per_blk   = spp->secs_per_blk;
+    npp->secs_per_pl    = spp->secs_per_pl;
+    npp->secs_per_lun   = spp->secs_per_lun;
+    npp->secs_per_ch    = spp->secs_per_ch;
 
-    npp->pgs_per_pl     = ssdp->pgs_per_pl;
-    npp->pgs_per_lun    = ssdp->pgs_per_lun;
-    npp->pgs_per_ch     = ssdp->pgs_per_ch;
+    npp->pgs_per_pl     = spp->pgs_per_pl;
+    npp->pgs_per_lun    = spp->pgs_per_lun;
+    npp->pgs_per_ch     = spp->pgs_per_ch;
 
-    npp->blks_per_lun   = ssdp->blks_per_lun;
-    npp->blks_per_ch    = ssdp->blks_per_ch;
+    npp->blks_per_lun   = spp->blks_per_lun;
+    npp->blks_per_ch    = spp->blks_per_ch;
 
-    npp->pls_per_ch     = ssdp->pls_per_ch;
+    npp->pls_per_ch     = spp->pls_per_ch;
 
     npp->tt_secs    = npp->secs_per_ch  * npp->nchs;
     npp->tt_pgs     = npp->pgs_per_ch   * npp->nchs;
@@ -191,8 +191,8 @@ static void namespace_init_params(struct namespace_params *npp, struct ssdparams
     npp->tt_pls     = npp->pls_per_ch   * npp->nchs;
     npp->tt_luns    = npp->luns_per_ch  * npp->nchs;
 
-    npp->gc_thres_pcent         = ssdp->gc_thres_pcent;
-    npp->gc_thres_pcent_high    = ssdp->gc_thres_pcent_high;
+    npp->gc_thres_pcent         = spp->gc_thres_pcent;
+    npp->gc_thres_pcent_high    = spp->gc_thres_pcent_high;
     npp->gc_thres_blocks        = (int)((1 - npp->gc_thres_pcent) * npp->tt_blks);
     npp->gc_thres_blocks_high   = (int)((1 - npp->gc_thres_pcent_high) * npp->tt_blks);
     npp->enable_gc_delay        = true;
@@ -339,14 +339,9 @@ void ssd_init(FemuCtrl *n)
 
     ftl_assert(ssd);
 
-    /* init statistic module */
-    ssd->statistics = g_malloc0(sizeof(struct statistic)*n->num_namespaces);
-
     ssd_init_params(spp, n);
     for( int  i = 0; i < n->num_namespaces ; i ++){
         ns_init(n, &n->namespaces[i]);
-        statistic_init(&ssd->statistics[i]);
-        n->namespaces[i].statistic = &ssd->statistics[i];
     }
 
     /* initialize ssd internal layout architecture */
@@ -710,7 +705,6 @@ static uint64_t gc_write_page(struct NvmeNamespace *ns, struct ppa *old_ppa)
     new_lun = get_lun(ns->ssd, &new_ppa);
     new_lun->gc_endtime = new_lun->next_lun_avail_time;
 
-    gc_write(ns->statistic);
     return 0;
 }
 
@@ -899,8 +893,6 @@ static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
         sublat = ssd_advance_status(ns->ssd, &ppa, &srd);
         maxlat = (sublat > maxlat) ? sublat : maxlat;
 
-        user_read(ns->statistic);
-        inc_iops(ns->statistic);
     }
 
     return maxlat;
@@ -957,9 +949,6 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
         /* get latency statistics */
         curlat = ssd_advance_status(ns->ssd, &ppa, &swr);
         maxlat = (curlat > maxlat) ? curlat : maxlat;
-
-        user_write(ns->statistic);
-        inc_iops(ns->statistic);
     }
 
     return maxlat;

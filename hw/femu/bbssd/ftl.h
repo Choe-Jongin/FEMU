@@ -259,8 +259,6 @@ struct ssd {
     QemuThread ftl_thread;
     QemuThread ch_swap_thread;
     struct ch_swap_args args;
-
-    struct statistic *statistics;   // statistic list
 };
 void ns_init(FemuCtrl *n, NvmeNamespace *ns);
 void ssd_init(FemuCtrl *n);

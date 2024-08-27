@@ -18,9 +18,6 @@
 #include "nand/nand.h"
 #include "timing-model/timing.h"
 
-#include "bbssd/statistic.h"
-
-
 #define NVME_ID_NS_LBADS(ns)                                                  \
     ((ns)->id_ns.lbaf[NVME_ID_NS_FLBAS_INDEX((ns)->id_ns.flbas)].lbads)
 
@@ -1172,8 +1169,8 @@ typedef struct NvmeNamespace {
     struct ssd *ssd;
     int start_lpn;
     int *ch_list;
-    struct statistic *statistic;
-    int waiting_io;
+    int *chip_list;
+    int nchips;
 
     void *state;
 } NvmeNamespace;
@@ -1255,6 +1252,8 @@ typedef struct BbCtrlParams {
 
     int gc_thres_pcent;
     int gc_thres_pcent_high;
+
+    char *chips_per_ns; // CAST Lab : "1,3,4" -> ns1:1chip, ns2:3chip, ns3:4chip
 } BbCtrlParams;
 
 typedef struct ZNSCtrlParams {

@@ -161,7 +161,6 @@ static void nvme_process_cq_cpl(void *arg, int index_poller)
         pqueue_pop(pq);
         processed++;
         n->nr_tt_ios++;
-        req->ns->waiting_io--;
 
         if (now - req->expire_time >= 20000) {
             n->nr_tt_late_ios++;
@@ -432,7 +431,6 @@ static uint16_t nvme_io_cmd(FemuCtrl *n, NvmeCmd *cmd, NvmeRequest *req)
     }
 
     req->ns = ns = &n->namespaces[nsid - 1];
-    req->ns->waiting_io++;
 
     switch (cmd->opcode) {
     case NVME_CMD_FLUSH:

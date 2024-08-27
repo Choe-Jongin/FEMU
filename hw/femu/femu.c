@@ -366,18 +366,42 @@ static int nvme_init_namespace(FemuCtrl *n, NvmeNamespace *ns, Error **errp)
     ns->util = bitmap_new(num_blks);
     ns->uncorrectable = bitmap_new(num_blks); 
 
-    //CASTLAB :
-    ns->waiting_io = 0;
     return 0;
 }
 
-static int nvme_init_namespaces(FemuCtrl *n, Error **errp, uint64_t size)
+static int nvme_init_namespaces(FemuCtrl *n, Error **errp, uint64_t ssd_size)
 {
     int i;
+    uint64_t tt_chips;
+    tt_chips =  (uint64_t)n->bb_params.luns_per_ch*
+                (uint64_t)n->bb_params.nchs;
+
+    //parsing the namespaces size(# of chips)
+    char str[256];
+    strcpy(str, n->bb_params.chips_per_ns);
+    int chips = 0;
+    int ns_index = 0;
+    for(i = 0; i < 256; i++){
+        if('0' <= str[i] && str[i] <= '9'){
+            chips *= 10;
+            chips += str[i] - '0';
+        }else if(str[i] == '/' || str[i] == '\0'){
+            n->namespaces[ns_index].nchips = chips;
+            n->namespaces[ns_index].size = ssd_size*chips/tt_chips;  // same as (chip_size*chips) / (ssd_size + OP) = ssd_size * (chips/tt_chips)
+            ++ns_index;
+            chips = 0;
+            if(str[i] == '\0')
+                break;
+        }
+    }
 
     for (i = 0; i < n->num_namespaces; i++) {
         NvmeNamespace *ns = &n->namespaces[i];
-        ns->size = size;
+        printf("ns%d %dchips\n", i, ns->nchips);
+    }
+
+    for (i = 0; i < n->num_namespaces; i++) {
+        NvmeNamespace *ns = &n->namespaces[i];
         ns->start_block = i * ns->size >> BDRV_SECTOR_BITS;
         ns->id = i + 1;
         init_dram_backend_logical_space(&n->mbe, i, ns->size);
@@ -548,7 +572,6 @@ static void femu_realize(PCIDevice *pci_dev, Error **errp)
     n->completed = 0;
     n->start_time = time(NULL);
     n->reg_size = pow2ceil(0x1004 + 2 * (n->nr_io_queues + 1) * 4);
-    n->ns_size = bs_size / (uint64_t)n->num_namespaces;
 
     /* Coperd: [1..nr_io_queues] are used as IO queues */
     n->sq = g_malloc0(sizeof(*n->sq) * (n->nr_io_queues + 1));
@@ -560,7 +583,7 @@ static void femu_realize(PCIDevice *pci_dev, Error **errp)
 
     nvme_init_pci(n);
     nvme_init_ctrl(n);
-    nvme_init_namespaces(n, errp, n->ns_size);
+    nvme_init_namespaces(n, errp, bs_size);
 
     nvme_register_extensions(n);
     
@@ -682,6 +705,7 @@ static Property femu_props[] = {
     DEFINE_PROP_INT32("ch_xfer_lat", FemuCtrl, bb_params.ch_xfer_lat, 0),
     DEFINE_PROP_INT32("gc_thres_pcent", FemuCtrl, bb_params.gc_thres_pcent, 75),
     DEFINE_PROP_INT32("gc_thres_pcent_high", FemuCtrl, bb_params.gc_thres_pcent_high, 95),
+    DEFINE_PROP_STRING("chips_per_ns", FemuCtrl, bb_params.chips_per_ns),   
     DEFINE_PROP_END_OF_LIST(),
 };
 
@@ -708,11 +732,20 @@ static void femu_class_init(ObjectClass *oc, void *data)
     dc->vmsd = &femu_vmstate;
 }
 
+/* CAST Lab for femu_props */
+static void femu_instance_init(Object *obj)
+{
+    FemuCtrl *n = FEMU(obj);
+    n->bb_params.chips_per_ns = g_malloc0(256 * sizeof(char));
+    strcpy(n->bb_params.chips_per_ns,"1");
+}
+
 static const TypeInfo femu_info = {
     .name          = "femu",
     .parent        = TYPE_PCI_DEVICE,
     .instance_size = sizeof(FemuCtrl),
     .class_init    = femu_class_init,
+    .instance_init = femu_instance_init,  // 인스턴스 초기화 콜백 등록
     .interfaces = (InterfaceInfo[]) {
         { INTERFACE_PCIE_DEVICE },
         { }
