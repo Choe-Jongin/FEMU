@@ -10,18 +10,41 @@ uint64_t ftl_start = 0;
 /* Must be dependent on Namespace policy */ 
 static void set_ns_start_index(struct NvmeNamespace *ns)
 {
-    int start_ch = 0;
+    int start_lun = 0;
     int start_lpn = 0;
     for( int i = 0 ; i < ns->id-1 ; i++){
-        uint64_t ch = ns->ctrl->namespaces[i].np.nchs;
-        uint64_t pgs = ns->ctrl->namespaces[i].np.tt_pgs;
-        start_ch += ch;
+        uint64_t luns = ns->ctrl->namespaces[i].np.tt_luns;
+        uint64_t pgs = ns->ctrl->namespaces[i].np.pgs_per_lun;
+        start_lun += luns;
         start_lpn += pgs;
     }
     ns->start_lpn = start_lpn;
+}
 
-    for( int i = 0 ; i < ns->np.nchs ; i++){
-        ns->ch_list[i] = start_ch + i;
+static void set_luns_to_ns(FemuCtrl *n)
+{   
+    NvmeNamespace *ns = NULL;
+    int nsid = 1;
+    int lun_index;
+
+    ns = &n->namespaces[nsid-1];
+    lun_index = 0;
+
+    struct ssdparams *spp = &ns->ssd->sp;
+    for( int i = 0 ; i < spp->nchs ; i++){
+        for( int j = 0 ; j < spp->luns_per_ch ; j++){
+            struct nand_lun *lun = &n->ssd->ch[i].lun[j];
+            /* assign to next ns */
+            if( lun_index == ns->nluns ){
+                if( ++nsid == n->num_namespaces ){
+                    return;
+                }
+                ns = &n->namespaces[nsid-1];
+                lun_index = 0;
+            }
+
+            ns->lun_list[lun_index++] = lun;
+        }
     }
 }
 
@@ -268,6 +291,10 @@ static void ssd_init_nand_lun(struct nand_lun *lun, struct ssdparams *spp)
     lun->next_lun_avail_time = 0;
     lun->busy = false;
 
+    lun->victim_block_pq = pqueue_init(spp->pgs_per_blk, victim_block_cmp_pri,
+            victim_block_get_pri, victim_block_set_pri,
+            victim_block_get_pos, victim_block_set_pos);
+
     lun->wp = get_next_free_block(lun)->ppa.g.blk;
 }
 
@@ -312,24 +339,10 @@ void ns_init(FemuCtrl *n, NvmeNamespace *ns)
     uint64_t phy_size; // phy_size = ns->size(MB) * (1 + OP)
     phy_size = ns->size/(1024*1024) * ((uint64_t)spp->tt_secs * spp->secsz) / n->memsz;
     ns->ssd = ssd;
-    ns->bm = g_malloc0(sizeof(struct block_mgmt));
     namespace_init_params(&ns->np, spp, phy_size);
-    ns->ch_list = g_malloc0(sizeof(int) * spp->nchs);
-
-    struct block_mgmt *bm = ns->bm;
-    bm->victim_block_pq = pqueue_init(ns->np.tt_blks, victim_block_cmp_pri,
-            victim_block_get_pri, victim_block_set_pri,
-            victim_block_get_pos, victim_block_set_pos);
-    bm->wp_ch = bm->wp_lun = 0;
+    ns->lun_list = g_malloc0(sizeof(struct nand_lun*) * ns->nluns);
 
     set_ns_start_index(ns);
-
-    printf("physical:%ldByte, nch:%d( ", phy_size, ns->np.nchs);
-
-    for( int i = 0 ; i < ns->np.nchs ; i++){
-        printf("%2dch ", ns->ch_list[i]);
-    }
-    printf(")\r\n");
 }
 
 void ssd_init(FemuCtrl *n)
@@ -343,7 +356,16 @@ void ssd_init(FemuCtrl *n)
     for( int  i = 0; i < n->num_namespaces ; i ++){
         ns_init(n, &n->namespaces[i]);
     }
+    set_luns_to_ns(n);
 
+    /* print lun infomation */
+    for( int nsid = 1 ; nsid <= n->num_namespaces ; nsid++){
+        NvmeNamespace *ns = &n->namespaces[nsid-1];
+        printf("physical:%ldByte, nluns:%d ", (long)ns->np.tt_secs*(long)ns->np.secsz, ns->nluns);
+        for( int i = 0 ; i < ns->np.nchs ; i++){
+            printf("| ch%2d, lun%2d ", ns->lun_list[i]->ppa.g.ch, ns->lun_list[i]->ppa.g.lun);
+        }
+    }
     /* initialize ssd internal layout architecture */
     ssd->ch = g_malloc0(sizeof(struct ssd_channel) * spp->nchs);
     for (int i = 0; i < spp->nchs; i++) {
@@ -470,16 +492,10 @@ static uint64_t ssd_advance_status(struct ssd *ssd, struct ppa *ppa, struct
 
 static struct ppa get_new_page(struct NvmeNamespace *ns)
 {
-    struct block_mgmt *bm = ns->bm;
-    struct nand_lun *cur_lun = NULL;
+    struct nand_lun *cur_lun = ns->lun_list[ns->write_lun];
     struct ppa ppa;
-    ppa.ppa = 0;
-    
-    ppa.g.ch    = ns->ch_list[bm->wp_ch];
-    ppa.g.lun   = bm->wp_lun;
+    ppa.ppa     = cur_lun->ppa.ppa;
     ppa.g.pl    = 0;
-
-    cur_lun     = get_lun(ns->ssd, &ppa);
     ppa.g.blk   = cur_lun->wp;
     ppa.g.pg    = cur_lun->pl[ppa.g.pl].blk[ppa.g.blk].wp;
     // printf("new ppa ns:%d, ch:%d, lun:%d, blk:%d, page:%d \r\n", ns->id, ppa.g.ch, ppa.g.lun, ppa.g.blk, ppa.g.pg);
@@ -488,71 +504,45 @@ static struct ppa get_new_page(struct NvmeNamespace *ns)
 
 static nand_block *chip_gc(struct NvmeNamespace *ns, struct nand_lun *lun)
 {
-    struct block_mgmt *bm = NULL;
     struct nand_block *victim_block = NULL;
-    int max_ipc;
 
     /* select victim block in chip (no in namespace) */
-    max_ipc = -1;
-    for (int i = 0; i < ns->np.blks_per_pl; i++) {
-        if (lun->pl[0].blk[i].state == BLOCK_FULL && max_ipc < lun->pl[0].blk[i].ipc) {
-            max_ipc = lun->pl[0].blk[i].ipc;
-            victim_block = &lun->pl[0].blk[i];
-        }
-    }
-
+    victim_block = pqueue_peek(lun->victim_block_pq);
     if (!victim_block) {
         ftl_err("failed victim block select in intra chip gc\r\n");
-        lun->chip_gc_now = false;
         return NULL;
     }
 
     if (victim_block->pos) {
-        pqueue_remove(bm->victim_block_pq, victim_block);
+        victim_block = pqueue_pop(lun->victim_block_pq);
         victim_block->pos = 0;
-        bm->victim_block_cnt--;
+        lun->victim_block_cnt--;
     }
 
     /* make free block */
     free_block(ns, &victim_block->ppa);
-    lun->chip_gc_now = false;
     return victim_block;
 }
 
-static void ns_advance_ch(struct NvmeNamespace *ns)
+static void ns_advance_write_lun(struct NvmeNamespace *ns)
 {
-    struct block_mgmt *bm = ns->bm;
-    struct namespace_params *npp = &ns->np;
-    struct nand_lun *next_lun;
-    struct ppa ppa;
-    ppa.ppa = 0;
-
     /* increase wp by channel-first, lun-second */
     while(1){
-        bm->wp_ch++;
-        if( bm->wp_ch == npp->nchs){
-            bm->wp_ch = 0;
-            bm->wp_lun++;
-            if (bm->wp_lun == npp->luns_per_ch) {
-                bm->wp_lun = 0;
-            }
+        if( ++ns->write_lun == ns->nluns){
+            ns->write_lun = 0;
         }
 
         // condition check
-        ppa.g.ch    = ns->ch_list[bm->wp_ch];
-        ppa.g.lun   = bm->wp_lun;
-        next_lun = get_lun(ns->ssd, &ppa);
-        
-        if( next_lun->wp == -1 ){
+        if( ns->lun_list[ns->write_lun]->wp == -1 ){
             continue;
         }
 
         break;
     }
 }
+
 static void lun_advance_write_pointer(struct NvmeNamespace *ns, struct nand_lun *curr_lun)
 {
-    struct block_mgmt *bm = ns->bm;
     struct nand_block *curr_block = NULL;
     struct nand_block *next_block = NULL;
 
@@ -562,16 +552,15 @@ static void lun_advance_write_pointer(struct NvmeNamespace *ns, struct nand_lun 
     /* page over in block */
     if (curr_block->wp == ns->np.pgs_per_blk) {
         curr_block->state = BLOCK_FULL;
-        pqueue_insert(bm->victim_block_pq, curr_block);
-        bm->victim_block_cnt++;
+        pqueue_insert(curr_lun->victim_block_pq, curr_block);
+        curr_lun->victim_block_cnt++;
 
         next_block = get_next_free_block(curr_lun);
         if (next_block == NULL) {           // no free block in chip         
             curr_lun->wp = -1;              // no write pointer
-            ns_advance_ch(ns);              // inchip gc 도중 원래 칩을 참조하는 것을 방지
+            ns_advance_write_lun(ns);       // inchip gc 도중 원래 칩을 참조하는 것을 방지
             next_block = chip_gc(ns, curr_lun);  // so make free block
             if (next_block != NULL) {
-                /* remove from bm->pq */
                 struct nand_plane *pl = &curr_lun->pl[0];
                 QTAILQ_REMOVE(&pl->free_block_list, next_block, entry);
                 pl->free_block_cnt--;
@@ -587,23 +576,14 @@ static void lun_advance_write_pointer(struct NvmeNamespace *ns, struct nand_lun 
 
 static void ssd_advance_write_pointer(struct NvmeNamespace *ns)
 {
-    struct block_mgmt *bm = ns->bm;
-    struct nand_lun *curr_lun = NULL;
-    struct ppa ppa;
-    ppa.ppa = 0;
-
-    ppa.g.ch    = ns->ch_list[bm->wp_ch];
-    ppa.g.lun   = bm->wp_lun;
-    curr_lun     = get_lun(ns->ssd, &ppa);
-
-    ns_advance_ch(ns);
-    lun_advance_write_pointer(ns, curr_lun);
+    ns_advance_write_lun(ns);
+    lun_advance_write_pointer(ns, ns->lun_list[ns->write_lun]);
 }
 
 /* update SSD status about one page from PG_VALID -> PG_VALID */
 static void mark_page_invalid(struct NvmeNamespace *ns, struct ppa *ppa)
 {
-    struct block_mgmt *bm = ns->bm;
+    struct nand_lun *lun = NULL;
     struct nand_block *blk = NULL;
     struct nand_page *pg = NULL;
 
@@ -613,11 +593,12 @@ static void mark_page_invalid(struct NvmeNamespace *ns, struct ppa *ppa)
     pg->status = PG_INVALID;
 
     /* update corresponding block status */
+    lun = get_lun(ns->ssd, ppa);
     blk = get_blk(ns->ssd, ppa);
     blk->ipc++;
     blk->vpc--;
     if ( blk->pos ) {
-        pqueue_change_priority(bm->victim_block_pq , blk->vpc, blk);
+        pqueue_change_priority(lun->victim_block_pq , blk->vpc, blk);
     }
 }
 
@@ -710,30 +691,35 @@ static uint64_t gc_write_page(struct NvmeNamespace *ns, struct ppa *old_ppa)
 
 static struct nand_block *select_victim_block(struct NvmeNamespace *ns, bool force)
 {
-    struct block_mgmt *bm = ns->bm;
+    struct nand_lun *lun = NULL;
     struct nand_block *victim_block = NULL;
-
-    victim_block = pqueue_peek(bm->victim_block_pq);
-    if (!victim_block) {
-        return NULL;
-    }
-
-    while( victim_block->state != BLOCK_FULL ) {
-        pqueue_pop(bm->victim_block_pq);
-        victim_block = pqueue_peek(bm->victim_block_pq);
-        if (!victim_block) {
-            return NULL;
+    int min_vpc = ns->np.pgs_per_blk;
+    int lun_index = -1;
+    
+    /* search minimum vpc block across all luns in ns */
+    for( int i = 0; i < ns->nluns; i++ ){
+        lun = ns->lun_list[i];
+        victim_block = pqueue_peek(lun->victim_block_pq);
+        if( victim_block != NULL && victim_block->vpc < min_vpc){
+            min_vpc = victim_block->vpc;
+            lun_index = i;
         }
     }
 
-    if (!force && victim_block->ipc < ns->np.pgs_per_blk / 16) { 
-        if( victim_block->ipc < 4 )
-            return NULL;
+    if (lun_index == -1) {
+        printf("victim_block_pq is empty\n");
+        return NULL;
     }
 
-    victim_block = pqueue_pop(bm->victim_block_pq);
+    lun = ns->lun_list[lun_index];
+    victim_block = pqueue_peek(lun->victim_block_pq);
+    if (!force && victim_block->ipc < ns->np.pgs_per_blk / 16) { 
+        return NULL;
+    }  
+
+    victim_block = pqueue_pop(lun->victim_block_pq);
     victim_block->pos = 0;
-    bm->victim_block_cnt--;
+    lun->victim_block_cnt--;
     return victim_block;
 }
 
@@ -784,81 +770,44 @@ static int do_gc(struct NvmeNamespace *ns, bool force)
 {
     struct nand_block *victim_block = NULL;
 
-    if(pqueue_peek(ns->bm->victim_block_pq) == NULL){
-        printf("victim_block_pq is empty\n");
-        return -1;
-    }
     victim_block = select_victim_block(ns, force);
     if (!victim_block) {
-        if( pqueue_peek(ns->bm->victim_block_pq) && ((struct nand_block *)pqueue_peek(ns->bm->victim_block_pq))->ipc < 4 )
-            printf("ns%d No victim here!! vpc:%d ipc:%d\r\n", ns->id, ((struct nand_block *)pqueue_peek(ns->bm->victim_block_pq))->vpc, ((struct nand_block *)pqueue_peek(ns->bm->victim_block_pq))->ipc);
         return -1;
     }
 
-    // printf("GC nsid:%d, ch:%d, lun:%d, blk:%d\r\n", ns->id, victim_block->ppa.g.ch, victim_block->ppa.g.lun, victim_block->ppa.g.blk);
     free_block(ns, &victim_block->ppa);
     return 0;
 }
 
 static inline bool should_gc(struct NvmeNamespace *ns)
 {
-    // struct block_mgmt *bm = ns->bm;
+    struct nand_lun *lun;
     int free_block_cnt = 0;
-    struct ppa ppa;
-    ppa.ppa = 0;
-    for (int i = 0; i < ns->np.nchs; i++){
-        for (int j = 0; j < ns->np.luns_per_ch; j++){
-            for (int k = 0; k < ns->np.pls_per_lun; k++){
-                ppa.g.ch = ns->ch_list[i];
-                ppa.g.lun = j;
-                ppa.g.pl = k;
-                struct nand_plane *pl= get_pl(ns->ssd, &ppa); 
-                free_block_cnt += pl->free_block_cnt;
-            }
-        }
+
+    for (int i = 0; i < ns->nluns; i++){
+        lun = ns->lun_list[i];
+        free_block_cnt += lun->pl[0].free_block_cnt;
     }
-    free_block_cnt = ns->np.tt_blks - ns->bm->victim_block_cnt - ns->np.tt_luns;
     return (free_block_cnt <= ns->np.gc_thres_blocks);
 }
 
 static inline bool should_gc_high(struct NvmeNamespace *ns)
 {
-    // struct block_mgmt *bm = ns->bm;
-    uint64_t free_block_cnt = 0;
-    struct ppa ppa;
-    ppa.ppa = 0;
-    for (int i = 0; i < ns->np.nchs; i++){
-        for (int j = 0; j < ns->np.luns_per_ch; j++){
-            for (int k = 0; k < ns->np.pls_per_lun; k++){
-                ppa.g.ch = ns->ch_list[i];
-                ppa.g.lun = j;
-                ppa.g.pl = k;
-                struct nand_plane *pl= get_pl(ns->ssd, &ppa); 
-                free_block_cnt += pl->free_block_cnt;
-            }
-        }
+    struct nand_lun *lun;
+    int free_block_cnt = 0;
+
+    for (int i = 0; i < ns->nluns; i++){
+        lun = ns->lun_list[i];
+        free_block_cnt += lun->pl[0].free_block_cnt;
     }
     return (free_block_cnt <= ns->np.gc_thres_blocks_high);
 }
 
 static inline void check_chip_gc(struct NvmeNamespace *ns)
 {
-    struct ssd *ssd = ns->ssd;
-    struct nand_lun *lun;
-    struct nand_plane *pl;
-    struct ppa ppa;
-
-    ppa.ppa = 0;
-    for (int i = 0; i < ns->np.nchs; i++){
-        for (int j = 0; j < ns->np.luns_per_ch; j++){
-            ppa.g.ch = ns->ch_list[i];
-            ppa.g.lun = j;
-            ppa.g.pl = 0;
-            lun = get_lun(ssd, &ppa);
-            pl= get_pl(ssd, &ppa);
-            if( pl->free_block_cnt < ns->np.blks_per_pl/8 )
-                chip_gc(ns, lun);
-        }
+    for (int i = 0; i < ns->nluns; i++){
+        if( ns->lun_list[i]->pl[0].free_block_cnt < ns->np.blks_per_pl/16 )
+            chip_gc(ns, ns->lun_list[i]);
     }
 }
 static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)

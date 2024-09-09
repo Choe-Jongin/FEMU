@@ -383,10 +383,10 @@ static int nvme_init_namespaces(FemuCtrl *n, Error **errp, uint64_t ssd_size)
     int ns_index = 0;
     for(i = 0; i < 256; i++){
         if('0' <= str[i] && str[i] <= '9'){
-            chips *= 10;
-            chips += str[i] - '0';
+            chips *= 10;                // a -> a0
+            chips += str[i] - '0';      // a0 -> ab
         }else if(str[i] == '/' || str[i] == '\0'){
-            n->namespaces[ns_index].nchips = chips;
+            n->namespaces[ns_index].nluns = chips;
             n->namespaces[ns_index].size = ssd_size*chips/tt_chips;  // same as (chip_size*chips) / (ssd_size + OP) = ssd_size * (chips/tt_chips)
             ++ns_index;
             chips = 0;
@@ -397,7 +397,7 @@ static int nvme_init_namespaces(FemuCtrl *n, Error **errp, uint64_t ssd_size)
 
     for (i = 0; i < n->num_namespaces; i++) {
         NvmeNamespace *ns = &n->namespaces[i];
-        printf("ns%d %dchips\n", i, ns->nchips);
+        printf("ns%d %dchips\n", i+1, ns->nluns);
     }
 
     for (i = 0; i < n->num_namespaces; i++) {

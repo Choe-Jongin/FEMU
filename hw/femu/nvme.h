@@ -1165,12 +1165,11 @@ typedef struct NvmeNamespace {
     /* for multi namespaces(only black-box) */
     struct namespace_params np;
     void *wp;   // write_pointer
-    struct block_mgmt *bm;   // block_mgmt
     struct ssd *ssd;
     int start_lpn;
-    int *ch_list;
-    int *chip_list;
-    int nchips;
+    int nluns;
+    struct nand_lun **lun_list;
+    int write_lun;
 
     void *state;
 } NvmeNamespace;

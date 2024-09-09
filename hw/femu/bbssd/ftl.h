@@ -111,7 +111,7 @@ struct nand_plane {
 
     QTAILQ_HEAD(free_block_list, nand_block) free_block_list;
     int free_block_cnt;
-
+    
     struct ppa ppa;
 };
 
@@ -124,6 +124,11 @@ struct nand_lun {
 
     int wp; /* current write block pointer */
     bool chip_gc_now;
+
+    /* for multi namespace */
+
+    pqueue_t *victim_block_pq;
+    int victim_block_cnt;
 
     struct ppa ppa;
 };
@@ -213,36 +218,12 @@ struct ssdparams {
 //     int full_line_cnt;
 // };
 
-struct block_mgmt {
-    struct nand_block *blks;
-    int tt_blks;
-
-    // write pointer
-    int wp_ch;
-    int wp_lun;
-
-    pqueue_t *victim_block_pq;
-    int victim_block_cnt;
-};
-
 struct nand_cmd {
     int type;
     int cmd;
     int64_t stime; /* Coperd: request arrival time */
 };
 
-struct chip_swap_args{
-    struct NvmeNamespace *ns1;
-    struct NvmeNamespace *ns2;
-    struct ppa ppa1;
-    struct ppa ppa2;
-};
-struct ch_swap_args{
-    struct NvmeNamespace *ns1;
-    struct NvmeNamespace *ns2;
-    int ch1;
-    int ch2;
-};
 struct ssd {
     char *ssdname;
     struct ssdparams sp;
@@ -257,12 +238,9 @@ struct ssd {
     struct rte_ring **to_poller;
     bool *dataplane_started_ptr;
     QemuThread ftl_thread;
-    QemuThread ch_swap_thread;
-    struct ch_swap_args args;
 };
 void ns_init(FemuCtrl *n, NvmeNamespace *ns);
 void ssd_init(FemuCtrl *n);
-void do_swap(FemuCtrl *n);
 
 #ifdef FEMU_DEBUG_FTL
 #define ftl_debug(fmt, ...) \
