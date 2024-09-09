@@ -21,8 +21,9 @@ static void set_ns_start_index(struct NvmeNamespace *ns)
     ns->start_lpn = start_lpn;
 }
 
-static void set_luns_to_ns(FemuCtrl *n)
+static void assign_luns_to_ns(FemuCtrl *n)
 {   
+    struct ssdparams *spp = &n->ssd->sp;
     NvmeNamespace *ns = NULL;
     int nsid = 1;
     int lun_index;
@@ -30,13 +31,12 @@ static void set_luns_to_ns(FemuCtrl *n)
     ns = &n->namespaces[nsid-1];
     lun_index = 0;
 
-    struct ssdparams *spp = &ns->ssd->sp;
     for( int i = 0 ; i < spp->nchs ; i++){
         for( int j = 0 ; j < spp->luns_per_ch ; j++){
             struct nand_lun *lun = &n->ssd->ch[i].lun[j];
             /* assign to next ns */
             if( lun_index == ns->nluns ){
-                if( ++nsid == n->num_namespaces ){
+                if( nsid++ == n->num_namespaces ){
                     return;
                 }
                 ns = &n->namespaces[nsid-1];
@@ -183,10 +183,9 @@ static void ssd_init_params(struct ssdparams *spp, FemuCtrl *n)
     check_params(spp);
 }
  
-static void namespace_init_params(struct namespace_params *npp, struct ssdparams *spp, uint64_t phy_size)
+static void namespace_init_params(struct namespace_params *npp, struct ssdparams *spp, int nluns)
 {
     npp->secsz = spp->secsz;
-    npp->nchs = phy_size/((uint64_t)spp->secs_per_ch*(uint64_t)spp->secsz); 
     npp->secs_per_pg = spp->secs_per_pg;
     npp->pgs_per_blk = spp->pgs_per_blk;
     npp->blks_per_pl = spp->blks_per_pl;
@@ -208,11 +207,11 @@ static void namespace_init_params(struct namespace_params *npp, struct ssdparams
 
     npp->pls_per_ch     = spp->pls_per_ch;
 
-    npp->tt_secs    = npp->secs_per_ch  * npp->nchs;
-    npp->tt_pgs     = npp->pgs_per_ch   * npp->nchs;
-    npp->tt_blks    = npp->blks_per_ch  * npp->nchs;
-    npp->tt_pls     = npp->pls_per_ch   * npp->nchs;
-    npp->tt_luns    = npp->luns_per_ch  * npp->nchs;
+    npp->tt_secs        = npp->secs_per_lun     * nluns;
+    npp->tt_pgs         = npp->pgs_per_lun      * nluns;
+    npp->tt_blks        = npp->blks_per_lun     * nluns;
+    npp->tt_pls         = npp->pls_per_ch       * nluns;
+    npp->tt_luns        = npp->luns_per_ch      * nluns;
 
     npp->gc_thres_pcent         = spp->gc_thres_pcent;
     npp->gc_thres_pcent_high    = spp->gc_thres_pcent_high;
@@ -336,10 +335,10 @@ void ns_init(FemuCtrl *n, NvmeNamespace *ns)
     struct ssd *ssd = n->ssd;
     struct ssdparams *spp = &ssd->sp;
 
-    uint64_t phy_size; // phy_size = ns->size(MB) * (1 + OP)
-    phy_size = ns->size/(1024*1024) * ((uint64_t)spp->tt_secs * spp->secsz) / n->memsz;
+    // uint64_t phy_size; // phy_size = ns->size(MB) * (1 + OP)
+    // phy_size = ns->size/(1024*1024) * ((uint64_t)spp->tt_secs * spp->secsz) / n->memsz;
     ns->ssd = ssd;
-    namespace_init_params(&ns->np, spp, phy_size);
+    namespace_init_params(&ns->np, spp, ns->nluns);
     ns->lun_list = g_malloc0(sizeof(struct nand_lun*) * ns->nluns);
 
     set_ns_start_index(ns);
@@ -356,16 +355,7 @@ void ssd_init(FemuCtrl *n)
     for( int  i = 0; i < n->num_namespaces ; i ++){
         ns_init(n, &n->namespaces[i]);
     }
-    set_luns_to_ns(n);
 
-    /* print lun infomation */
-    for( int nsid = 1 ; nsid <= n->num_namespaces ; nsid++){
-        NvmeNamespace *ns = &n->namespaces[nsid-1];
-        printf("physical:%ldByte, nluns:%d ", (long)ns->np.tt_secs*(long)ns->np.secsz, ns->nluns);
-        for( int i = 0 ; i < ns->np.nchs ; i++){
-            printf("| ch%2d, lun%2d ", ns->lun_list[i]->ppa.g.ch, ns->lun_list[i]->ppa.g.lun);
-        }
-    }
     /* initialize ssd internal layout architecture */
     ssd->ch = g_malloc0(sizeof(struct ssd_channel) * spp->nchs);
     for (int i = 0; i < spp->nchs; i++) {
@@ -373,6 +363,19 @@ void ssd_init(FemuCtrl *n)
         ssd->ch[i].ppa.g.ch = i;
         ssd_init_ch(&ssd->ch[i], spp);
     }
+
+    /* assign chips to each chip */
+    assign_luns_to_ns(n);
+
+    /* print lun infomation */
+    for( int nsid = 1 ; nsid <= n->num_namespaces ; nsid++){
+        NvmeNamespace *ns = &n->namespaces[nsid-1];
+        printf("physical:%ldByte, nluns:%d ", (long)ns->np.tt_secs*(long)ns->np.secsz, ns->nluns);
+        for( int i = 0 ; i < ns->nluns ; i++){
+            printf("| ch%2d, lun%2d ", ns->lun_list[i]->ppa.g.ch, ns->lun_list[i]->ppa.g.lun);
+        }
+    }
+    usleep(100000);
 
     /* initialize maptbl */
     ssd_init_maptbl(ssd);
