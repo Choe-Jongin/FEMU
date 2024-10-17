@@ -111,7 +111,7 @@ struct nand_plane {
 
     QTAILQ_HEAD(free_block_list, nand_block) free_block_list;
     int free_block_cnt;
-    
+
     struct ppa ppa;
 };
 
@@ -126,7 +126,6 @@ struct nand_lun {
     bool chip_gc_now;
 
     /* for multi namespace */
-
     pqueue_t *victim_block_pq;
     int victim_block_cnt;
 
@@ -238,6 +237,10 @@ struct ssd {
     struct rte_ring **to_poller;
     bool *dataplane_started_ptr;
     QemuThread ftl_thread;
+
+
+    uint64_t next_log_time;
+    struct statistic *statistics;   // statistic list
 };
 void ns_init(FemuCtrl *n, NvmeNamespace *ns);
 void ssd_init(FemuCtrl *n);

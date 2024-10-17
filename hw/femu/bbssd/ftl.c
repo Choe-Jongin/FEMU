@@ -16,7 +16,7 @@ static void set_ns_start_index(struct NvmeNamespace *ns)
         uint64_t luns = ns->ctrl->namespaces[i].np.tt_luns;
         uint64_t pgs = ns->ctrl->namespaces[i].np.pgs_per_lun;
         start_lun += luns;
-        start_lpn += pgs;
+        start_lpn += pgs*luns;
     }
     ns->start_lpn = start_lpn;
 }
@@ -211,7 +211,7 @@ static void namespace_init_params(struct namespace_params *npp, struct ssdparams
     npp->tt_pgs         = npp->pgs_per_lun      * nluns;
     npp->tt_blks        = npp->blks_per_lun     * nluns;
     npp->tt_pls         = npp->pls_per_ch       * nluns;
-    npp->tt_luns        = npp->luns_per_ch      * nluns;
+    npp->tt_luns        = nluns;
 
     npp->gc_thres_pcent         = spp->gc_thres_pcent;
     npp->gc_thres_pcent_high    = spp->gc_thres_pcent_high;
@@ -335,8 +335,6 @@ void ns_init(FemuCtrl *n, NvmeNamespace *ns)
     struct ssd *ssd = n->ssd;
     struct ssdparams *spp = &ssd->sp;
 
-    // uint64_t phy_size; // phy_size = ns->size(MB) * (1 + OP)
-    // phy_size = ns->size/(1024*1024) * ((uint64_t)spp->tt_secs * spp->secsz) / n->memsz;
     ns->ssd = ssd;
     namespace_init_params(&ns->np, spp, ns->nluns);
     ns->lun_list = g_malloc0(sizeof(struct nand_lun*) * ns->nluns);
@@ -350,10 +348,14 @@ void ssd_init(FemuCtrl *n)
     struct ssdparams *spp = &ssd->sp;
 
     ftl_assert(ssd);
+    /* init statistic module */
+    ssd->statistics = g_malloc0(sizeof(struct statistic)*n->num_namespaces);
 
     ssd_init_params(spp, n);
     for( int  i = 0; i < n->num_namespaces ; i ++){
         ns_init(n, &n->namespaces[i]);
+        statistic_init(&ssd->statistics[i]);
+        n->namespaces[i].statistic = &ssd->statistics[i];
     }
 
     /* initialize ssd internal layout architecture */
@@ -375,7 +377,7 @@ void ssd_init(FemuCtrl *n)
             printf("| ch%2d, lun%2d ", ns->lun_list[i]->ppa.g.ch, ns->lun_list[i]->ppa.g.lun);
         }
     }
-    usleep(100000);
+    usleep(1000000);
 
     /* initialize maptbl */
     ssd_init_maptbl(ssd);
@@ -689,6 +691,8 @@ static uint64_t gc_write_page(struct NvmeNamespace *ns, struct ppa *old_ppa)
     new_lun = get_lun(ns->ssd, &new_ppa);
     new_lun->gc_endtime = new_lun->next_lun_avail_time;
 
+    gc_write(ns->statistic);
+
     return 0;
 }
 
@@ -813,6 +817,7 @@ static inline void check_chip_gc(struct NvmeNamespace *ns)
             chip_gc(ns, ns->lun_list[i]);
     }
 }
+
 static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
 {
     struct NvmeNamespace * ns = req->ns;        // <- get Namespace!!
@@ -845,6 +850,8 @@ static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
         sublat = ssd_advance_status(ns->ssd, &ppa, &srd);
         maxlat = (sublat > maxlat) ? sublat : maxlat;
 
+        user_read(ns->statistic);
+        inc_iops(ns->statistic);
     }
 
     return maxlat;
@@ -853,7 +860,7 @@ static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
 static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
 {
     uint64_t lba = req->slba;
-    struct NvmeNamespace * ns = req->ns;        // <- get Namespace!!
+    struct NvmeNamespace * ns = req->ns;
     struct namespace_params *npp = &ns->np;
     int len = req->nlb;
     uint64_t start_lpn = lba / npp->secs_per_pg;
@@ -901,9 +908,32 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
         /* get latency statistics */
         curlat = ssd_advance_status(ns->ssd, &ppa, &swr);
         maxlat = (curlat > maxlat) ? curlat : maxlat;
+
+        user_write(ns->statistic);
+        inc_iops(ns->statistic);
     }
 
     return maxlat;
+}
+
+static void monitoring_to_file(void *arg)
+{
+    FemuCtrl *n = (FemuCtrl *)arg;
+    FILE *fp;
+    fp = fopen("monitoring.txt", "w");
+
+    fprintf(fp,  "[nsid]  FreeBlk chip0 chip1 | Invalid chip0 chip1\n");
+    for( int i = 0; i < n->num_namespaces; i++ ){
+        struct NvmeNamespace *ns = &n->namespaces[i];
+        int ipc0 = pqueue_peek(ns->lun_list[0]->victim_block_pq) ? ((struct nand_block*)pqueue_peek(ns->lun_list[0]->victim_block_pq))->ipc : -1;
+        int ipc1 = pqueue_peek(ns->lun_list[1]->victim_block_pq) ? ((struct nand_block*)pqueue_peek(ns->lun_list[1]->victim_block_pq))->ipc : -1;
+        int freeblk = ns->lun_list[0]->pl[0].free_block_cnt + ns->lun_list[1]->pl[0].free_block_cnt;
+        int invalid = ipc0 > ipc1 ? ipc0 : ipc1; 
+        fprintf(fp, "[ ns%d]  %7d %5d %5d | %7d %5d %5d  \r\n", ns->id, freeblk,
+                                                                ns->lun_list[0]->pl[0].free_block_cnt, ns->lun_list[1]->pl[0].free_block_cnt,
+                                                                invalid, ipc0, ipc1);
+    }
+    fclose(fp);
 }
 
 static void *ftl_thread(void *arg)
@@ -916,6 +946,7 @@ static void *ftl_thread(void *arg)
     int i;
 
     ftl_start = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    ssd->next_log_time = ftl_start + 1*1000*1000*1000;
     while (!*(ssd->dataplane_started_ptr)) {
         usleep(100000);
     }
@@ -962,6 +993,20 @@ static void *ftl_thread(void *arg)
             }
 
             check_chip_gc(req->ns);
+        }
+
+        uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+        if( now >= ssd->next_log_time ){
+            /* flush to file */
+            flush_to_file(ssd->statistics, n->num_namespaces);
+            monitoring_to_file(n);
+            for (int j = 0; j < n->num_namespaces; j++){
+                 /* init time unit */
+                one_clock(n->namespaces[j].statistic);
+            }
+
+            /* timer setting */
+            ssd->next_log_time += 1000*1000*1000;
         }
     }
     return NULL;

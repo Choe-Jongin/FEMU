@@ -384,7 +384,7 @@ static uint16_t nvme_identify_ns(FemuCtrl *n, NvmeCmd *cmd)
     uint32_t nsid = le32_to_cpu(c->nsid);
     uint64_t prp1 = le64_to_cpu(cmd->dptr.prp1);
     uint64_t prp2 = le64_to_cpu(cmd->dptr.prp2);
-    femu_log("[ CAST ] %s - nsid:%d\n\r", __func__, nsid);
+    // femu_log("[ CAST ] %s - nsid:%d\n\r", __func__, nsid);
 
     if (!nvme_nsid_valid(n, nsid) || nsid == NVME_NSID_BROADCAST) {
         return NVME_INVALID_NSID | NVME_DNR;
@@ -396,7 +396,7 @@ static uint16_t nvme_identify_ns(FemuCtrl *n, NvmeCmd *cmd)
     }
 
     if (c->csi == NVME_CSI_NVM && nvme_csi_has_nvm_support(ns)) {   
-        femu_log("[ CAST ] %s - read IdNs\n\r", __func__);
+        // femu_log("[ CAST ] %s - read IdNs\n\r", __func__);
         return dma_read_prp(n, (uint8_t *)&ns->id_ns, sizeof(NvmeIdNs),
                                  prp1, prp2);
     }
@@ -499,7 +499,7 @@ static uint16_t nvme_identify_nslist(FemuCtrl *n, NvmeCmd *cmd)
         if (j == data_len / sizeof(uint32_t)) {
             break;
         }
-        femu_log("[ CAST ] %s - id:%d \n\r", __func__, cpu_to_le32(ns->id)); 
+        // femu_log("[ CAST ] %s - id:%d \n\r", __func__, cpu_to_le32(ns->id)); 
     }
 
     return dma_read_prp(n, list, data_len, prp1, prp2);
@@ -572,18 +572,18 @@ static uint16_t nvme_identify_ns_descr_list(FemuCtrl *n, NvmeCmd *cmd)
     if (unlikely(!ns)) {
         return NVME_INVALID_FIELD | NVME_DNR;
     }
-    femu_log("[ CAST ] %s - nsid:%d\n\r", __func__, nsid);
+    // femu_log("[ CAST ] %s - nsid:%d\n\r", __func__, nsid);
     ns_descrs->uuid.hdr.nidt = NVME_NIDT_UUID;
     ns_descrs->uuid.hdr.nidl = NVME_NIDL_UUID;
     memcpy(&ns_descrs->uuid.v, n->uuid.data, NVME_NIDL_UUID);
 
-    femu_log("[ CAST ] %s - memcpy\n\r", __func__);
+    // femu_log("[ CAST ] %s - memcpy\n\r", __func__);
 
     ns_descrs->csi.hdr.nidt = NVME_NIDT_CSI;
     ns_descrs->csi.hdr.nidl = NVME_NIDL_CSI;
     ns_descrs->csi.v = n->csi;
 
-    femu_log("[ CAST ] %s - csi:%d\n\r", __func__, ns_descrs->csi.v);
+    // femu_log("[ CAST ] %s - csi:%d\n\r", __func__, ns_descrs->csi.v);
 
     return dma_read_prp(n, list, sizeof(list), prp1, prp2);
 }
@@ -606,7 +606,7 @@ static uint16_t nvme_identify(FemuCtrl *n, NvmeCmd *cmd)
     NvmeIdentify *c = (NvmeIdentify *)cmd;
     uint32_t cns  = le32_to_cpu(c->cns);
 
-    femu_log("[ CAST ] %s - cns:%d\n\r", __func__, cns);
+    // femu_log("[ CAST ] %s - cns:%d\n\r", __func__, cns);
 
     switch (cns) {
     case NVME_ID_CNS_NS:

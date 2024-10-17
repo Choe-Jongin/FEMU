@@ -18,6 +18,8 @@
 #include "nand/nand.h"
 #include "timing-model/timing.h"
 
+#include "bbssd/statistic.h"
+
 #define NVME_ID_NS_LBADS(ns)                                                  \
     ((ns)->id_ns.lbaf[NVME_ID_NS_FLBAS_INDEX((ns)->id_ns.flbas)].lbads)
 
@@ -1170,6 +1172,7 @@ typedef struct NvmeNamespace {
     int nluns;
     struct nand_lun **lun_list;
     int write_lun;
+    struct statistic *statistic;
 
     void *state;
 } NvmeNamespace;
