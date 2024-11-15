@@ -1446,7 +1446,7 @@ void analyze(struct ssd *ssd, struct NvmeNamespace *namespaces, int num_namespac
     
     /* 초기 모니터링이 끝남 */
     if( swap_mgmt->swap_status == 0 && avg_pe > 1.0f){
-        uint64_t ssd_total_life = ssd->sp.tt_secs*ssd->sp.secsz*MAX_PE;
+        uint64_t ssd_total_life = (uint64_t)ssd->sp.tt_secs*ssd->sp.secsz*MAX_PE;
         uint64_t total_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME)-ssd->start_log_time;
         uint64_t dev_wearout = (dev_write*ssd->sp.secs_per_pg*ssd->sp.secsz)/total_ns;
         swap_mgmt->swap_frequency = (ssd_total_life/dev_wearout)/160;
