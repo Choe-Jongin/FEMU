@@ -1418,7 +1418,7 @@ void analyze(struct ssd *ssd, struct NvmeNamespace *namespaces, int num_namespac
             max_pe = pe;
         avg_pe += (float)pe;
     } 
-    avg_pe /= ssd->sp.tt_luns;
+    avg_pe /= ssd->sp.tt_blks;
     fprintf(fp, "\n");
     
     fprintf(fp, "PEAS ");
@@ -1429,14 +1429,15 @@ void analyze(struct ssd *ssd, struct NvmeNamespace *namespaces, int num_namespac
         fprintf(fp, " %4d", pe/ssd->sp.blks_per_ch);
     } 
     fprintf(fp, "\n");
-    uint64_t dev_write = 0;
+    uint64_t ssd_dev_write = 0;
     for( int i = 0; i < num_namespaces ; i++ ){
         struct NvmeNamespace *ns = &namespaces[i];
         struct statistic *s = ns->statistic;
         struct time_unit prev = get_previous_statistic(s, 120, 60, TRUE);
         struct time_unit curr = get_previous_statistic(s, 60, 60, TRUE);
         int iops_rate = curr.iops*100 / (prev.iops != 0 ? prev.iops : 1);
-        dev_write = s->tot->us_write + s->tot->gc_write + s->tot->wl_write;
+        uint64_t dev_write = s->tot->us_write + s->tot->gc_write + s->tot->wl_write;
+        ssd_dev_write += dev_write;
         float WAF = (float)dev_write / (s->tot->us_write+1.0f);
         
         fprintf(fp, "ns%d User_Write %ldGB GC_Write %ldGB WL_Write %ldGB Device_Write %ldGB WAF %.2f IOPS_Drop %d%% Waiting %d\n", ns->id,
@@ -1447,14 +1448,14 @@ void analyze(struct ssd *ssd, struct NvmeNamespace *namespaces, int num_namespac
     /* 초기 모니터링이 끝남 */
     if( swap_mgmt->swap_status == 0 && avg_pe > 1.0f){
         uint64_t ssd_total_life = (uint64_t)ssd->sp.tt_secs*ssd->sp.secsz*MAX_PE;
-        uint64_t total_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME)-ssd->start_log_time;
-        uint64_t dev_wearout = (dev_write*ssd->sp.secs_per_pg*ssd->sp.secsz)/total_ns;
-        swap_mgmt->swap_frequency = (ssd_total_life/dev_wearout)/160;
+        uint64_t total_time = NS_TO_SEC(qemu_clock_get_ns(QEMU_CLOCK_REALTIME)-ssd->start_log_time);
+        uint64_t dev_wearout = (ssd_dev_write*ssd->sp.secs_per_pg*ssd->sp.secsz)/total_time;
+        swap_mgmt->swap_frequency = ((ssd_total_life/(dev_wearout?1:dev_wearout))/160)*1000000000;
         swap_mgmt->next_swap_time = ssd->start_log_time + swap_mgmt->swap_frequency;
         swap_mgmt->swap_status = 1;
     }
 
-    fprintf(fp,"Max PE %d AVG PE %.1f Imbalance %.2f \n", max_pe/ssd->sp.luns_per_ch, avg_pe, avg_pe!=0?(float)max_pe/avg_pe:1.0f);
+    fprintf(fp,"Max PE %d AVG PE %.1f Imbalance %.2f \n", max_pe/ssd->sp.blks_per_ch, avg_pe, avg_pe!=0?(float)max_pe/avg_pe:1.0f);
     fprintf(fp,"Swap Frequency %ld  Next Swap Time %ld \n", NS_TO_SEC(swap_mgmt->swap_frequency), NS_TO_SEC(swap_mgmt->next_swap_time - ssd->start_log_time));
     fprintf(fp,"MODE :%d\n", ssd->mode);
 
