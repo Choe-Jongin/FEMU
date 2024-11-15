@@ -44,7 +44,6 @@ enum {
     SORTED = 1,
 };
 
-
 enum {
     FEMU_ENABLE_GC_DELAY = 1,
     FEMU_DISABLE_GC_DELAY = 2,
@@ -57,6 +56,11 @@ enum {
     FEMU_DISABLE_LOG = 7,
 };
 
+enum {
+    MODE_NORMAL = 0,
+    MODE_ADAPTIVE = 1,
+    MODE_SEAMLESS = 2,
+};
 
 #define BLK_BITS    (16)
 #define PG_BITS     (16)
@@ -64,6 +68,11 @@ enum {
 #define PL_BITS     (8)
 #define LUN_BITS    (8)
 #define CH_BITS     (7)
+
+#define NS_TO_SEC(x) ((x)/(uint64_t)1000000000)
+#define PAGE_TO_GB(x) (((x)*16)/1024/1024)
+
+#define MAX_PE 600
 
 /* describe a physical page addr */
 struct ppa {
@@ -98,6 +107,7 @@ typedef struct nand_block {
     int erase_cnt;
     int wp; /* current write pointer */
     int state;
+    bool swapped; /* for swapping */
 
     QTAILQ_ENTRY(nand_block) entry;
     size_t pos;
@@ -129,6 +139,11 @@ struct nand_lun {
     pqueue_t *victim_block_pq;
     int victim_block_cnt;
 
+    /* for swapping */
+    int seamless_stage;
+    int erase_count;
+    int erase_count_after_swap;
+
     struct ppa ppa;
 };
 
@@ -158,9 +173,7 @@ struct ssdparams {
                        */
 
     double gc_thres_pcent;
-    int gc_thres_blocks;
     double gc_thres_pcent_high;
-    int gc_thres_blocks_high;
     bool enable_gc_delay;
 
     /* below are all calculated values */
@@ -183,39 +196,40 @@ struct ssdparams {
     int tt_pls;       /* total # of planes in the SSD */
 
     int tt_luns;      /* total # of LUNs in the SSD */
+
+    uint64_t max_swap_time;
 };
 
-// typedef struct line {
-//     int id;  /* line id, the same as corresponding block id */
-//     int ipc; /* invalid page count in this line */
-//     int vpc; /* valid page count in this line */
-//     QTAILQ_ENTRY(line) entry; /* in either {free,victim,full} list */
-//     /* position in the priority queue for victim lines */
-//     size_t                  pos;
-// } line;
+typedef struct swap_task{
+    uint64_t swap_timer;
+    struct ssd *ssd;
+    struct NvmeNamespace *ns1, *ns2;
+    struct nand_lun *lun1, *lun2;
+    QTAILQ_ENTRY(swap_task) entry;
 
-/* wp: record next write addr */
-// struct write_pointer {
-//     struct nand_block *cur_block;
-//     int ch;
-//     int lun;
-//     int pg;
-//     int blk;
-//     int pl;
-// };
+    uint64_t swap_start_time;
+    uint64_t block_start_time;
+}swap_task;
 
-// struct line_mgmt {
-//     struct line *lines;
-//     /* free line list, we only need to maintain a list of blk numbers */
-//     QTAILQ_HEAD(free_line_list, line) free_line_list;
-//     pqueue_t *victim_line_pq;
-//     //QTAILQ_HEAD(victim_line_list, line) victim_line_list;
-//     QTAILQ_HEAD(full_line_list, line) full_line_list;
-//     int tt_lines;
-//     int free_line_cnt;
-//     int victim_line_cnt;
-//     int full_line_cnt;
-// };
+struct swap_mgmt{
+    QTAILQ_HEAD(task_list, swap_task) *task_list;
+    struct NvmeNamespace *ns1, *ns2;
+    uint64_t swap_start_time;
+    uint64_t block_start_time;
+
+    /* for seamless*/
+    uint64_t swap_delay;
+    uint64_t original_iops;
+
+    int initial_monitoring;
+    uint64_t swap_frequency;
+    uint64_t next_swap_time;
+    uint64_t swap_status;
+
+    int now_swapping;
+    int mode;
+    int waiting_seamless;
+};
 
 struct nand_cmd {
     int type;
@@ -229,8 +243,6 @@ struct ssd {
     struct ssd_channel *ch;
     struct ppa *maptbl; /* page level mapping table */
     uint64_t *rmap;     /* reverse mapptbl, assume it's stored in OOB */
-    // struct write_pointer wp;
-    // struct line_mgmt lm;
 
     /* lockless ring for communication with NVMe IO thread */
     struct rte_ring **to_ftl;
@@ -238,13 +250,20 @@ struct ssd {
     bool *dataplane_started_ptr;
     QemuThread ftl_thread;
 
-
+    /* CAST LAB */
+    uint64_t start_log_time;
     uint64_t next_log_time;
     struct statistic *statistics;   // statistic list
+    struct swap_mgmt swap_mgmt;     // for swap management
+    int mode; //
+
+    FILE *logfile;
 };
 void ns_init(FemuCtrl *n, NvmeNamespace *ns);
 void ssd_init(FemuCtrl *n);
-
+void swap_channel(struct NvmeNamespace *ns1, int ch1, struct NvmeNamespace *ns2, int ch2);
+void start_swap(struct ssd *ssd, struct NvmeNamespace *namespaces, int num_namespaces);
+#define FEMU_DEBUG_FTL
 #ifdef FEMU_DEBUG_FTL
 #define ftl_debug(fmt, ...) \
     do { printf("[FEMU] FTL-Dbg: " fmt, ## __VA_ARGS__); } while (0)

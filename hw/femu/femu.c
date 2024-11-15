@@ -365,7 +365,11 @@ static int nvme_init_namespace(FemuCtrl *n, NvmeNamespace *ns, Error **errp)
     ns->ns_blks = ns_blks(ns, lba_index);
     ns->util = bitmap_new(num_blks);
     ns->uncorrectable = bitmap_new(num_blks); 
-
+    
+    /* CAST LAB */
+    ns->waiting_io = 0;
+    ns->lat_list = new_lat_list();
+    ns->swap_lat_list = new_lat_list();
     return 0;
 }
 

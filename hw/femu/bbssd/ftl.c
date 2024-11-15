@@ -3,9 +3,12 @@
 //#define FEMU_DEBUG_FTL
 
 static void *ftl_thread(void *arg);
+void monitoring_to_file(struct ssd *ssd);
+void analyze(struct ssd *ssd, struct NvmeNamespace *namespaces, int num_namespaces);
 static void free_block(struct NvmeNamespace *ns, struct ppa *ppa);
 
 uint64_t ftl_start = 0;
+QemuMutex swap_mutex;
 
 /* Must be dependent on Namespace policy */ 
 static void set_ns_start_index(struct NvmeNamespace *ns)
@@ -14,7 +17,7 @@ static void set_ns_start_index(struct NvmeNamespace *ns)
     int start_lpn = 0;
     for( int i = 0 ; i < ns->id-1 ; i++){
         uint64_t luns = ns->ctrl->namespaces[i].np.tt_luns;
-        uint64_t pgs = ns->ctrl->namespaces[i].np.pgs_per_lun;
+        uint64_t pgs = ns->ssd->sp.pgs_per_lun;
         start_lun += luns;
         start_lpn += pgs*luns;
     }
@@ -133,8 +136,8 @@ static void check_params(struct ssdparams *spp)
      * force luns_per_ch and nchs to be power of 2
      */
 
-    //ftl_assert(is_power_of_2(npp->luns_per_ch));
-    //ftl_assert(is_power_of_2(npp->nchs));
+    //ftl_assert(is_power_of_2(spp->luns_per_ch));
+    //ftl_assert(is_power_of_2(spp->nchs));
 }
 
 
@@ -176,48 +179,23 @@ static void ssd_init_params(struct ssdparams *spp, FemuCtrl *n)
 
     spp->tt_luns = spp->luns_per_ch * spp->nchs;
 
-    spp->gc_thres_blocks         = (int)((1 - spp->gc_thres_pcent) * spp->tt_blks);
-    spp->gc_thres_blocks_high    = (int)((1 - spp->gc_thres_pcent_high) * spp->tt_blks);
     spp->enable_gc_delay        = true;
+
+    spp->max_swap_time = ((uint64_t)spp->pgs_per_blk*(spp->pg_rd_lat + spp->pg_wr_lat) + spp->blk_er_lat)*spp->blks_per_lun;
 
     check_params(spp);
 }
  
 static void namespace_init_params(struct namespace_params *npp, struct ssdparams *spp, int nluns)
 {
-    npp->secsz = spp->secsz;
-    npp->secs_per_pg = spp->secs_per_pg;
-    npp->pgs_per_blk = spp->pgs_per_blk;
-    npp->blks_per_pl = spp->blks_per_pl;
-    npp->pls_per_lun = spp->pls_per_lun;
-    npp->luns_per_ch = spp->luns_per_ch;  
-
-    /* calculated values */
-    npp->secs_per_blk   = spp->secs_per_blk;
-    npp->secs_per_pl    = spp->secs_per_pl;
-    npp->secs_per_lun   = spp->secs_per_lun;
-    npp->secs_per_ch    = spp->secs_per_ch;
-
-    npp->pgs_per_pl     = spp->pgs_per_pl;
-    npp->pgs_per_lun    = spp->pgs_per_lun;
-    npp->pgs_per_ch     = spp->pgs_per_ch;
-
-    npp->blks_per_lun   = spp->blks_per_lun;
-    npp->blks_per_ch    = spp->blks_per_ch;
-
-    npp->pls_per_ch     = spp->pls_per_ch;
-
-    npp->tt_secs        = npp->secs_per_lun     * nluns;
-    npp->tt_pgs         = npp->pgs_per_lun      * nluns;
-    npp->tt_blks        = npp->blks_per_lun     * nluns;
-    npp->tt_pls         = npp->pls_per_ch       * nluns;
+    npp->tt_secs        = spp->secs_per_lun * nluns;
+    npp->tt_pgs         = spp->pgs_per_lun  * nluns;
+    npp->tt_blks        = spp->blks_per_lun * nluns;
+    npp->tt_pls         = spp->pls_per_ch   * nluns;
     npp->tt_luns        = nluns;
 
-    npp->gc_thres_pcent         = spp->gc_thres_pcent;
-    npp->gc_thres_pcent_high    = spp->gc_thres_pcent_high;
-    npp->gc_thres_blocks        = (int)((1 - npp->gc_thres_pcent) * npp->tt_blks);
-    npp->gc_thres_blocks_high   = (int)((1 - npp->gc_thres_pcent_high) * npp->tt_blks);
-    npp->enable_gc_delay        = true;
+    npp->gc_thres_blocks        = (int)((1 - spp->gc_thres_pcent)       * npp->tt_blks);
+    npp->chip_gc_thres_blocks   = (int)((1 - spp->gc_thres_pcent_high)  * spp->blks_per_lun);
 }
 
 static struct nand_block *get_next_free_block(struct nand_lun *lun)
@@ -227,7 +205,7 @@ static struct nand_block *get_next_free_block(struct nand_lun *lun)
 
     curr_block = QTAILQ_FIRST(&pl->free_block_list);
     if (!curr_block) {
-        printf("ch%d chip%d : No free block here!! \r\n", lun->ppa.g.ch, lun->ppa.g.lun);
+        femu_log("No free block here!! ch%d chip%d \r\n", lun->ppa.g.ch, lun->ppa.g.lun);
         return NULL;
     }
 
@@ -260,6 +238,7 @@ static void ssd_init_nand_blk(struct nand_block *blk, struct ssdparams *spp)
     blk->erase_cnt = 0;
     blk->wp = 0;
     blk->state = BLOCK_FREE;
+    blk->swapped = false;
 }
 
 static void ssd_init_nand_plane(struct nand_plane *pl, struct ssdparams *spp)
@@ -342,12 +321,23 @@ void ns_init(FemuCtrl *n, NvmeNamespace *ns)
     set_ns_start_index(ns);
 }
 
+static void ssd_init_swap_mgmt(struct ssd *ssd){
+    ssd->swap_mgmt.task_list = g_malloc0(sizeof(QTAILQ_HEAD(task_list, swap_task)));
+    QTAILQ_INIT(ssd->swap_mgmt.task_list);
+
+    ssd->swap_mgmt.now_swapping = false;
+    ssd->swap_mgmt.swap_status = 0;
+    ssd->swap_mgmt.swap_frequency = 0;
+    ssd->swap_mgmt.next_swap_time = 0;
+}
+
 void ssd_init(FemuCtrl *n)
 {
     struct ssd *ssd = n->ssd;
     struct ssdparams *spp = &ssd->sp;
 
     ftl_assert(ssd);
+
     /* init statistic module */
     ssd->statistics = g_malloc0(sizeof(struct statistic)*n->num_namespaces);
 
@@ -372,11 +362,18 @@ void ssd_init(FemuCtrl *n)
     /* print lun infomation */
     for( int nsid = 1 ; nsid <= n->num_namespaces ; nsid++){
         NvmeNamespace *ns = &n->namespaces[nsid-1];
-        printf("physical:%ldByte, nluns:%d ", (long)ns->np.tt_secs*(long)ns->np.secsz, ns->nluns);
+        printf("physical:%ldByte, nluns:%d", (long)ns->np.tt_secs*(long)ssd->sp.secsz, ns->nluns);
         for( int i = 0 ; i < ns->nluns ; i++){
-            printf("| ch%2d, lun%2d ", ns->lun_list[i]->ppa.g.ch, ns->lun_list[i]->ppa.g.lun);
+            printf(" | ch%2d,lun%d", ns->lun_list[i]->ppa.g.ch, ns->lun_list[i]->ppa.g.lun);
         }
+        printf("\r\n");
     }
+
+    ssd->mode = MODE_NORMAL;
+
+    ssd->logfile = fopen("log.txt","w");
+    fclose(ssd->logfile);
+
     usleep(1000000);
 
     /* initialize maptbl */
@@ -384,6 +381,9 @@ void ssd_init(FemuCtrl *n)
 
     /* initialize rmap */
     ssd_init_rmap(ssd);
+
+    /* initialize swap_mgmt */
+    ssd_init_swap_mgmt(ssd);
 
     qemu_thread_create(&ssd->ftl_thread, "FEMU-FTL-Thread", ftl_thread, n,
                        QEMU_THREAD_JOINABLE);
@@ -503,11 +503,10 @@ static struct ppa get_new_page(struct NvmeNamespace *ns)
     ppa.g.pl    = 0;
     ppa.g.blk   = cur_lun->wp;
     ppa.g.pg    = cur_lun->pl[ppa.g.pl].blk[ppa.g.blk].wp;
-    // printf("new ppa ns:%d, ch:%d, lun:%d, blk:%d, page:%d \r\n", ns->id, ppa.g.ch, ppa.g.lun, ppa.g.blk, ppa.g.pg);
     return ppa;
 }
 
-static nand_block *chip_gc(struct NvmeNamespace *ns, struct nand_lun *lun)
+static int do_chip_gc(struct NvmeNamespace *ns, struct nand_lun *lun)
 {
     struct nand_block *victim_block = NULL;
 
@@ -515,7 +514,7 @@ static nand_block *chip_gc(struct NvmeNamespace *ns, struct nand_lun *lun)
     victim_block = pqueue_peek(lun->victim_block_pq);
     if (!victim_block) {
         ftl_err("failed victim block select in intra chip gc\r\n");
-        return NULL;
+        return -1;
     }
 
     if (victim_block->pos) {
@@ -524,9 +523,10 @@ static nand_block *chip_gc(struct NvmeNamespace *ns, struct nand_lun *lun)
         lun->victim_block_cnt--;
     }
 
+    inc_chip_gc(ns->statistic);
     /* make free block */
     free_block(ns, &victim_block->ppa);
-    return victim_block;
+    return 0;
 }
 
 static void ns_advance_write_lun(struct NvmeNamespace *ns)
@@ -555,37 +555,42 @@ static void lun_advance_write_pointer(struct NvmeNamespace *ns, struct nand_lun 
     curr_block->wp++;
 
     /* page over in block */
-    if (curr_block->wp == ns->np.pgs_per_blk) {
+    if (curr_block->wp == ns->ssd->sp.pgs_per_blk) {
         curr_block->state = BLOCK_FULL;
         pqueue_insert(curr_lun->victim_block_pq, curr_block);
         curr_lun->victim_block_cnt++;
 
         next_block = get_next_free_block(curr_lun);
-        if (next_block == NULL) {           // no free block in chip         
+        if (next_block == NULL) {           // no free block in chip
+            femu_log("[ CAST ] ERR! no free block in ch%d lun%d\r\n", curr_lun->ppa.g.ch, curr_lun->ppa.g.lun);
             curr_lun->wp = -1;              // no write pointer
-            ns_advance_write_lun(ns);       // inchip gc 도중 원래 칩을 참조하는 것을 방지
-            next_block = chip_gc(ns, curr_lun);  // so make free block
-            if (next_block != NULL) {
-                struct nand_plane *pl = &curr_lun->pl[0];
-                QTAILQ_REMOVE(&pl->free_block_list, next_block, entry);
-                pl->free_block_cnt--;
-                next_block->state = BLOCK_OPEN;
-            }
+            ns_advance_write_lun(ns);       // 재귀참조 방지
+            if( do_chip_gc(ns, curr_lun) != -1 ){ // so make free block
+                next_block = get_next_free_block(curr_lun);
+            }       
+        }
+
+        // swap 도중이면 새로 할당 받은 블럭이 swap된 블럭으로 표시
+        if (curr_lun->seamless_stage != 0 && next_block != NULL) {
+            next_block->swapped = true;
         }
 
         if (next_block != NULL) {
             curr_lun->wp = next_block->ppa.g.blk;
         }
+
+        for(int i=0; i < ns->ssd->sp.pgs_per_blk ; i++)
+            ftl_assert(curr_lun->pl[0].blk[curr_lun->wp].pg[i].status == PG_FREE);
     }
 }
 
 static void ssd_advance_write_pointer(struct NvmeNamespace *ns)
 {
-    ns_advance_write_lun(ns);
     lun_advance_write_pointer(ns, ns->lun_list[ns->write_lun]);
+    ns_advance_write_lun(ns);
 }
 
-/* update SSD status about one page from PG_VALID -> PG_VALID */
+/* update SSD status about one page */
 static void mark_page_invalid(struct NvmeNamespace *ns, struct ppa *ppa)
 {
     struct nand_lun *lun = NULL;
@@ -601,9 +606,10 @@ static void mark_page_invalid(struct NvmeNamespace *ns, struct ppa *ppa)
     lun = get_lun(ns->ssd, ppa);
     blk = get_blk(ns->ssd, ppa);
     blk->ipc++;
-    blk->vpc--;
     if ( blk->pos ) {
-        pqueue_change_priority(lun->victim_block_pq , blk->vpc, blk);
+        pqueue_change_priority(lun->victim_block_pq, blk->vpc - 1, blk);
+    }else{
+        blk->vpc--;
     }
 }
 
@@ -619,7 +625,7 @@ static void mark_page_valid(struct NvmeNamespace *ns, struct ppa *ppa)
 
     /* update corresponding block status */
     blk = get_blk(ns->ssd, ppa);
-    ftl_assert(blk->vpc >= 0 && blk->vpc < ns->np.pgs_per_blk);
+    ftl_assert(blk->vpc >= 0 && blk->vpc < ns->ssd->sp.pgs_per_blk);
     blk->vpc++;
 }
 
@@ -641,7 +647,7 @@ static void mark_block_free(struct ssd *ssd, struct ppa *ppa)
     pl->free_block_cnt++;
 
     /* reset block status */
-    ftl_assert(blk->npgs == npp->pgs_per_blk);
+    ftl_assert(blk->npgs == ssd->sp.pgs_per_blk);
     blk->ipc = 0;
     blk->vpc = 0;
     blk->wp = 0;
@@ -652,7 +658,7 @@ static void mark_block_free(struct ssd *ssd, struct ppa *ppa)
 static void gc_read_page(NvmeNamespace *ns, struct ppa *ppa)
 {
     /* advance ssd status, we don't care about how long it takes */
-    if (ns->np.enable_gc_delay) {
+    if (ns->ssd->sp.enable_gc_delay) {
         struct nand_cmd gcr;
         gcr.type = GC_IO;
         gcr.cmd = NAND_READ;
@@ -680,7 +686,7 @@ static uint64_t gc_write_page(struct NvmeNamespace *ns, struct ppa *old_ppa)
     /* need to advance the write pointer here */
     ssd_advance_write_pointer(ns);
 
-    if (ns->np.enable_gc_delay) {
+    if (ns->ssd->sp.enable_gc_delay) {
         struct nand_cmd gcw;
         gcw.type = GC_IO;
         gcw.cmd = NAND_WRITE;
@@ -700,7 +706,7 @@ static struct nand_block *select_victim_block(struct NvmeNamespace *ns, bool for
 {
     struct nand_lun *lun = NULL;
     struct nand_block *victim_block = NULL;
-    int min_vpc = ns->np.pgs_per_blk;
+    int min_vpc = ns->ssd->sp.pgs_per_blk;
     int lun_index = -1;
     
     /* search minimum vpc block across all luns in ns */
@@ -714,13 +720,14 @@ static struct nand_block *select_victim_block(struct NvmeNamespace *ns, bool for
     }
 
     if (lun_index == -1) {
-        printf("victim_block_pq is empty\n");
+        femu_log("[ CAST ] victim_block_pq is empty\n");
         return NULL;
     }
 
     lun = ns->lun_list[lun_index];
     victim_block = pqueue_peek(lun->victim_block_pq);
-    if (!force && victim_block->ipc < ns->np.pgs_per_blk / 16) { 
+    if (!force && victim_block->ipc < ns->ssd->sp.pgs_per_blk / 8) { 
+        femu_log("[ CAST ] Failed to select victim block ns%d vpc%d ipc%d \r\n",ns->id, victim_block->vpc, victim_block->ipc);
         return NULL;
     }  
 
@@ -733,13 +740,25 @@ static struct nand_block *select_victim_block(struct NvmeNamespace *ns, bool for
 /* here ppa identifies the block we want to clean */
 static void clean_one_block(struct NvmeNamespace *ns, struct ppa *ppa)
 {
-    struct namespace_params *npp = &ns->np;
+    struct ssd *ssd = ns->ssd;
+    struct ssdparams *spp = &ssd->sp;
+    struct nand_lun *lun = NULL;
+    struct nand_block *block = NULL;
     struct nand_page *pg_iter = NULL;
     int cnt = 0;
 
-    for (int pg = 0; pg < npp->pgs_per_blk; pg++) {
+    lun = get_lun(ssd, ppa);
+    block = get_blk(ssd, ppa);
+    if(lun->seamless_stage != 0 && block->swapped == false) {
+        if( ns == ssd->swap_mgmt.ns1){
+            ns = ssd->swap_mgmt.ns2;
+        }else if( ns == ssd->swap_mgmt.ns2){
+            ns = ssd->swap_mgmt.ns1;
+        }
+    }
+    for (int pg = 0; pg < spp->pgs_per_blk; pg++) {
         ppa->g.pg = pg;
-        pg_iter = get_pg(ns->ssd, ppa);
+        pg_iter = get_pg(ssd, ppa);
         /* there shouldn't be any free page in victim blocks */
         if (pg_iter->status == PG_VALID) {
             gc_read_page(ns, ppa);
@@ -755,21 +774,23 @@ static void clean_one_block(struct NvmeNamespace *ns, struct ppa *ppa)
 static void free_block(struct NvmeNamespace *ns, struct ppa *ppa)
 {   
     struct ssd *ssd = ns->ssd;
-    struct namespace_params *npp = &ns->np;
+    struct ssdparams *spp = &ns->ssd->sp;
     struct nand_lun *lunp;
 
     lunp = get_lun(ssd, ppa);
     clean_one_block(ns, ppa);
     mark_block_free(ssd, ppa);
 
-    if (npp->enable_gc_delay) {
+    if (spp->enable_gc_delay) {
         struct nand_cmd gce;
         gce.type = GC_IO;
         gce.cmd = NAND_ERASE;
         gce.stime = 0;
         ssd_advance_status(ssd, ppa, &gce);
     }
-    
+
+    lunp->erase_count++;
+    lunp->erase_count_after_swap++;
     lunp->gc_endtime = lunp->next_lun_avail_time;
 }
 
@@ -798,35 +819,25 @@ static inline bool should_gc(struct NvmeNamespace *ns)
     return (free_block_cnt <= ns->np.gc_thres_blocks);
 }
 
-static inline bool should_gc_high(struct NvmeNamespace *ns)
-{
-    struct nand_lun *lun;
-    int free_block_cnt = 0;
-
-    for (int i = 0; i < ns->nluns; i++){
-        lun = ns->lun_list[i];
-        free_block_cnt += lun->pl[0].free_block_cnt;
-    }
-    return (free_block_cnt <= ns->np.gc_thres_blocks_high);
-}
-
-static inline void check_chip_gc(struct NvmeNamespace *ns)
+static inline int should_chip_gc(struct NvmeNamespace *ns)
 {
     for (int i = 0; i < ns->nluns; i++){
-        if( ns->lun_list[i]->pl[0].free_block_cnt < ns->np.blks_per_pl/16 )
-            chip_gc(ns, ns->lun_list[i]);
+        if( ns->lun_list[i]->pl[0].free_block_cnt < ns->np.chip_gc_thres_blocks )
+            return i;
     }
+    return -1;
 }
 
 static uint64_t ssd_read(struct ssd *ssd, NvmeRequest *req)
 {
-    struct NvmeNamespace * ns = req->ns;        // <- get Namespace!!
+    struct NvmeNamespace * ns = req->ns;
+    struct ssdparams *spp = &ns->ssd->sp;
     struct namespace_params *npp = &ns->np;
     uint64_t lba = req->slba;
     int nsecs = req->nlb;
     struct ppa ppa;
-    uint64_t start_lpn = lba / npp->secs_per_pg;
-    uint64_t end_lpn = (lba + nsecs - 1) / npp->secs_per_pg;
+    uint64_t start_lpn = lba / spp->secs_per_pg;
+    uint64_t end_lpn = (lba + nsecs - 1) / spp->secs_per_pg;
     uint64_t lpn;
     uint64_t sublat, maxlat = 0;
 
@@ -861,10 +872,11 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
 {
     uint64_t lba = req->slba;
     struct NvmeNamespace * ns = req->ns;
+    struct ssdparams *spp = &ns->ssd->sp;
     struct namespace_params *npp = &ns->np;
     int len = req->nlb;
-    uint64_t start_lpn = lba / npp->secs_per_pg;
-    uint64_t end_lpn = (lba + len - 1) / npp->secs_per_pg;
+    uint64_t start_lpn = lba / spp->secs_per_pg;
+    uint64_t end_lpn = (lba + len - 1) / spp->secs_per_pg;
     struct ppa ppa;
     uint64_t lpn;
     uint64_t curlat = 0, maxlat = 0;
@@ -874,15 +886,16 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
         ftl_err("start_lpn=%"PRIu64",tt_pgs=%d\r\n", start_lpn, ns->np.tt_pgs);
     }
 
-    while (should_gc_high(ns)) {
+    while ((r = should_chip_gc(ns)) >=0 ) {
         /* perform GC here until !should_gc(ssd) */
-        r = do_gc(ns, true);
+        r = do_chip_gc(ns, ns->lun_list[r]);
         if (r == -1)
             break;
     }
 
     for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
         ppa = get_maptbl_ent(ns, lpn);
+
         if (mapped_ppa(&ppa)) {
             /* update old page information first */
             mark_page_invalid(ns, &ppa);
@@ -916,22 +929,539 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
     return maxlat;
 }
 
-static void monitoring_to_file(void *arg)
+static void wl_read_page(NvmeNamespace *ns, struct ppa *ppa)
 {
-    FemuCtrl *n = (FemuCtrl *)arg;
-    FILE *fp;
-    fp = fopen("monitoring.txt", "w");
+    struct nand_cmd wlr;
+    wlr.type = WL_IO;
+    wlr.cmd = NAND_READ;
+    wlr.stime = 0;
+    ssd_advance_status(ns->ssd, ppa, &wlr);
+    wl_read(ns->statistic);
+}
 
-    fprintf(fp,  "[nsid]  FreeBlk chip0 chip1 | Invalid chip0 chip1\n");
-    for( int i = 0; i < n->num_namespaces; i++ ){
-        struct NvmeNamespace *ns = &n->namespaces[i];
-        int ipc0 = pqueue_peek(ns->lun_list[0]->victim_block_pq) ? ((struct nand_block*)pqueue_peek(ns->lun_list[0]->victim_block_pq))->ipc : -1;
-        int ipc1 = pqueue_peek(ns->lun_list[1]->victim_block_pq) ? ((struct nand_block*)pqueue_peek(ns->lun_list[1]->victim_block_pq))->ipc : -1;
-        int freeblk = ns->lun_list[0]->pl[0].free_block_cnt + ns->lun_list[1]->pl[0].free_block_cnt;
-        int invalid = ipc0 > ipc1 ? ipc0 : ipc1; 
-        fprintf(fp, "[ ns%d]  %7d %5d %5d | %7d %5d %5d  \r\n", ns->id, freeblk,
-                                                                ns->lun_list[0]->pl[0].free_block_cnt, ns->lun_list[1]->pl[0].free_block_cnt,
-                                                                invalid, ipc0, ipc1);
+static void wp_block_close(struct NvmeNamespace *ns, struct nand_lun *lun)
+{
+    struct ssd *ssd = ns->ssd;
+    struct nand_block * blk;
+    struct nand_page *pg_iter;
+    struct ppa ppa;
+
+    ppa.ppa = lun->ppa.ppa;
+    ppa.g.blk = lun->wp;
+    blk = get_blk(ssd, &ppa);
+    for (int pg = 0; pg < ssd->sp.pgs_per_blk; pg++)
+    {
+        ppa.g.pg = pg;
+        pg_iter = get_pg(ssd, &ppa);
+        if (pg_iter->status == PG_FREE)
+        {
+            pg_iter->status = PG_INVALID;
+            blk->ipc++;
+        }
+    }
+    blk->wp = ssd->sp.pgs_per_blk-1;
+    lun_advance_write_pointer(ns, lun);
+}
+
+static struct nand_block *get_next_full_block(struct ssd *ssd, struct nand_lun *lun, int last_index)
+{
+    struct nand_block *next_full_block = NULL;
+    for (int blk = last_index; blk < ssd->sp.blks_per_lun; blk++) {
+        if( lun->pl[0].blk[blk].swapped == false 
+         && lun->pl[0].blk[blk].state == BLOCK_FULL 
+         && lun->pl[0].blk[blk].vpc > 0)
+        {
+            next_full_block = &lun->pl[0].blk[blk];
+
+            pqueue_remove(lun->victim_block_pq, next_full_block);
+            next_full_block->pos = 0;
+            lun->victim_block_cnt--;
+            break;
+        }
+    }
+    return next_full_block;
+}
+
+static void finish_swap_lun(struct swap_task *task)
+{
+    struct ssd *ssd = task->ssd;
+    struct nand_lun *lun1 = task->lun1;
+    struct nand_lun *lun2 = task->lun2;
+    struct ppa ppa1, ppa2;
+    ppa1.ppa = lun1->ppa.ppa;
+    ppa2.ppa = lun2->ppa.ppa;
+
+    femu_log("[ CAST ]  %lu sec [ch%d, lun%d] <-> [ch%d, lun%d]  Done. \r\n", 
+        NS_TO_SEC(qemu_clock_get_ns(QEMU_CLOCK_REALTIME)-task->block_start_time),
+        task->lun1->ppa.g.ch, task->lun1->ppa.g.lun, task->lun2->ppa.g.ch, task->lun2->ppa.g.lun);
+
+    lun1->seamless_stage = 0;
+    lun2->seamless_stage = 0;
+    for( int blk = 0 ; blk < ssd->sp.blks_per_lun ; blk++ ){
+        ppa1.g.blk = blk;
+        ppa2.g.blk = blk;
+        get_blk(ssd, &ppa1)->swapped = false;
+        get_blk(ssd, &ppa2)->swapped = false;
+    }
+
+    lun1->erase_count_after_swap = 0;
+    lun2->erase_count_after_swap = 0;
+}
+
+static int read_one_block(struct NvmeNamespace *ns, struct nand_block *blk, uint64_t *lpn_buffer, int start, int len)
+{
+    struct ppa ppa;
+    struct ssd *ssd = ns->ssd;
+    struct ssdparams *spp = &ssd->sp;
+    int count = 0;
+
+    if( blk == NULL ){
+        return 0;
+    }
+
+    ppa.ppa = blk->ppa.ppa;
+    for (int pg = 0; pg < spp->pgs_per_blk; pg++) {
+        ppa.g.pg = pg;
+        if (get_pg(ssd, &ppa)->status == PG_VALID) {
+            lpn_buffer[start+count++] = get_rmap_ent(ns, &ppa);
+            wl_read_page(ns, &ppa);
+            mark_page_invalid(ns, &ppa);
+        }
+        if( start+count == len )    // if len <= -1, read all pages
+            break;
+    }
+    return count;
+}
+
+/* move valid page data (already in DRAM) from victim block to a new page */
+static void wl_write_page(struct NvmeNamespace *ns, uint64_t lpn, struct nand_lun *write_lun)
+{
+    struct ppa ppa;
+
+    ppa.ppa     = write_lun->ppa.ppa;
+    ppa.g.blk   = write_lun->wp;
+    ppa.g.pg    = write_lun->pl[0].blk[write_lun->wp].wp;
+
+    ftl_assert(get_pg(ns->ssd, &ppa)->status == PG_FREE);
+    
+    ftl_assert(valid_lpn(ns, lpn));
+    /* update maptbl */
+    set_maptbl_ent(ns, lpn, &ppa);
+    /* update rmap */
+    set_rmap_ent(ns, lpn, &ppa);
+
+    mark_page_valid(ns, &ppa);
+
+    /* flash write cmd */
+    struct nand_cmd wlw;
+    wlw.type = WL_IO;
+    wlw.cmd = NAND_WRITE;
+    wlw.stime = 0;
+    ssd_advance_status(ns->ssd, &ppa, &wlw);
+
+    wl_write(ns->statistic);
+    
+    /* advance the write pointer */
+    lun_advance_write_pointer(ns, write_lun);
+}
+
+/* adaptive block swap */
+static void swap_block_adaptive( struct NvmeNamespace *ns1, struct nand_lun *lun1, struct nand_block *blk1, 
+                                 struct NvmeNamespace *ns2, struct nand_lun *lun2, struct nand_block *blk2)
+{
+    struct ssd *ssd = ns1->ssd;
+    struct nand_block *er_blk1, *er_blk2;
+    uint64_t *lpn_buffer1, *lpn_buffer2;
+    int lpn_idx1 = 0, lpn_idx2 = 0;
+    int count = 0;
+    lpn_buffer1 = g_malloc0(sizeof(uint64_t) * ssd->sp.pgs_per_blk);
+    lpn_buffer2 = g_malloc0(sizeof(uint64_t) * ssd->sp.pgs_per_blk);
+
+    er_blk1 = blk1;
+    er_blk2 = blk2;
+
+    lpn_idx1 = read_one_block(ns1, blk1, lpn_buffer1, 0, -1);
+    lpn_idx2 = read_one_block(ns2, blk2, lpn_buffer2, 0, -1);
+
+    while( lpn_idx1 != lpn_idx2 && blk1 != NULL && blk2 != NULL)
+    {
+        if(lpn_idx1 < lpn_idx2){
+            count = lpn_idx2;
+            blk1 = get_next_full_block(ssd, lun1, 0);
+            lpn_idx1 += read_one_block(ns1, blk1, lpn_buffer1, lpn_idx1, count);
+            if(blk1 != NULL && blk1 != er_blk1 ){
+                pqueue_insert(lun1->victim_block_pq, blk1);
+                lun1->victim_block_cnt++;
+            }
+        }else{
+            count = lpn_idx1;
+            blk2 = get_next_full_block(ssd, lun2, 0);
+            lpn_idx2 += read_one_block(ns2, blk2, lpn_buffer2, lpn_idx2, count);
+            if(blk2 != NULL && blk2 != er_blk2 ){
+                pqueue_insert(lun2->victim_block_pq, blk2);
+                lun2->victim_block_cnt++;
+            }
+        }
+    }
+
+    // wait for all page read
+    if(blk1 != NULL && blk2 != NULL){
+        if (lun1->next_lun_avail_time > lun2->next_lun_avail_time){
+            lun2->next_lun_avail_time = lun1->next_lun_avail_time;
+        }else{
+            lun1->next_lun_avail_time = lun2->next_lun_avail_time;
+        }    
+    }
+
+    if (er_blk1 != NULL) {
+        free_block(ns2, &er_blk1->ppa);
+    }
+    if (er_blk2 != NULL) {
+        free_block(ns1, &er_blk2->ppa);
+    }
+
+    /* move counterpart chip */
+    for (int i = 0; i < lpn_idx1; i++){
+        wl_write_page(ns1, lpn_buffer1[i], lun2);
+    }
+    for (int i = 0; i < lpn_idx2; i++){
+        wl_write_page(ns2, lpn_buffer2[i], lun1);
+    }
+
+    g_free(lpn_buffer1);
+    g_free(lpn_buffer2);
+}
+
+/* CAST : Swap two lun */
+static uint64_t swap_lun_adaptive(struct swap_task *task)
+{
+    struct ssd *ssd = task->ssd;
+    struct NvmeNamespace *ns1 = task->ns1;
+    struct NvmeNamespace *ns2 = task->ns2;
+    struct nand_lun *lun1 = task->lun1;
+    struct nand_lun *lun2 = task->lun2;
+    struct nand_block *blk1 = NULL;
+    struct nand_block *blk2 = NULL;
+
+    uint64_t later_avail = lun1->next_lun_avail_time > lun2->next_lun_avail_time ? lun1->next_lun_avail_time : lun2->next_lun_avail_time;
+    lun1->next_lun_avail_time = lun2->next_lun_avail_time = later_avail;
+    lun1->seamless_stage = 2;       // block swap stage
+    lun2->seamless_stage = 2;       // block swap stage
+
+    blk1 = get_next_full_block(ssd, lun1, 0);
+    blk2 = get_next_full_block(ssd, lun2, 0);
+
+    if( blk1 == NULL && blk2 == NULL ){
+        return 0;
+    }
+
+    swap_block_adaptive(ns1, lun1, blk1, ns2, lun2, blk2);
+    
+    // wait block IO 
+    later_avail = lun1->next_lun_avail_time > lun2->next_lun_avail_time ? lun1->next_lun_avail_time : lun2->next_lun_avail_time;
+    if( blk1 != NULL && blk2 != NULL ){
+        lun1->next_lun_avail_time = lun2->next_lun_avail_time = later_avail;
+    }
+    uint64_t next_swap_time = later_avail + (uint64_t)1*1000*1000;
+    return next_swap_time;
+}
+
+/* normal block swap */
+static void swap_block( struct NvmeNamespace *ns1, struct nand_lun *lun1, struct nand_block *blk1, 
+                        struct NvmeNamespace *ns2, struct nand_lun *lun2, struct nand_block *blk2)
+{
+    struct ssd *ssd = ns1->ssd;
+    uint64_t *lpn_buffer1, *lpn_buffer2;
+    int lpn_idx1 = 0, lpn_idx2 = 0;
+    lpn_buffer1 = g_malloc0(sizeof(uint64_t) * ssd->sp.pgs_per_blk);
+    lpn_buffer2 = g_malloc0(sizeof(uint64_t) * ssd->sp.pgs_per_blk);
+
+    lpn_idx1 = read_one_block(ns1, blk1, lpn_buffer1, 0, -1);
+    lpn_idx2 = read_one_block(ns2, blk2, lpn_buffer2, 0, -1);
+
+    // wait for all page read
+    if( blk1 != NULL && blk2 != NULL){
+        if (lun1->next_lun_avail_time > lun2->next_lun_avail_time){
+            lun2->next_lun_avail_time = lun1->next_lun_avail_time;
+        }else{
+            lun1->next_lun_avail_time = lun2->next_lun_avail_time;
+        }    
+    }
+
+    if (blk1 != NULL) {
+        free_block(ns2, &blk1->ppa);
+    }
+    if (blk2 != NULL) {
+        free_block(ns1, &blk2->ppa);
+    }
+
+    /* move counterpart chip */
+    for (int i = 0; i < lpn_idx1; i++){
+        wl_write_page(ns1, lpn_buffer1[i], lun2);
+    }
+    for (int i = 0; i < lpn_idx2; i++){
+        wl_write_page(ns2, lpn_buffer2[i], lun1);
+    }
+
+    g_free(lpn_buffer1);
+    g_free(lpn_buffer2);
+}
+
+/* CAST : Swap two lun */
+static uint64_t swap_lun(struct swap_task *task)
+{
+    struct ssd *ssd = task->ssd;
+    struct NvmeNamespace *ns1 = task->ns1;
+    struct NvmeNamespace *ns2 = task->ns2;
+    struct nand_lun *lun1 = task->lun1;
+    struct nand_lun *lun2 = task->lun2;
+    struct nand_block *blk1 = NULL;
+    struct nand_block *blk2 = NULL;
+    uint64_t later_avail = lun1->next_lun_avail_time > lun2->next_lun_avail_time ? lun1->next_lun_avail_time : lun2->next_lun_avail_time;
+    lun1->next_lun_avail_time = lun2->next_lun_avail_time = later_avail;
+    lun1->seamless_stage = 2;       // block swap stage
+    lun2->seamless_stage = 2;       // block swap stage
+
+    blk1 = get_next_full_block(ssd, lun1, 0);
+    blk2 = get_next_full_block(ssd, lun2, 0);
+
+    if( blk1 == NULL && blk2 == NULL ){
+        return 0;
+    }
+
+    swap_block(ns1, lun1, blk1, ns2, lun2, blk2);
+
+    // wait block IO 
+    later_avail = lun1->next_lun_avail_time > lun2->next_lun_avail_time ? lun1->next_lun_avail_time : lun2->next_lun_avail_time;
+    // lun1->next_lun_avail_time = lun2->next_lun_avail_time = later_avail;
+    uint64_t next_swap_time = later_avail + (uint64_t)1*1000*1000;
+    return next_swap_time;
+}
+
+/* CAST : Swap two channel */
+void swap_channel(struct NvmeNamespace *ns1, int ch1, struct NvmeNamespace *ns2, int ch2)
+{
+    struct ssd *ssd = ns1->ssd;
+    struct ssdparams *spp = &ssd->sp;
+    struct nand_lun **swap_lun_list1;
+    struct nand_lun **swap_lun_list2;
+
+    qemu_mutex_lock(&swap_mutex);
+
+    /* TODO : 같은 채널 예외처리 */
+    // do something
+    
+    swap_lun_list1 = g_malloc0(sizeof(struct nand_lun*) * spp->luns_per_ch);
+    swap_lun_list2 = g_malloc0(sizeof(struct nand_lun*) * spp->luns_per_ch);
+    for( int i = 0 ; i < spp->luns_per_ch ; i++ ){
+        swap_lun_list1[i] = ns1->lun_list[ch1*spp->luns_per_ch+i];
+        swap_lun_list2[i] = ns2->lun_list[ch2*spp->luns_per_ch+i];
+    }
+
+    /* TODO : sort lun_list1 by erase count */
+    // do something
+
+    femu_log("[ CAST ] Channel swap [ns%d, ch%d] <-> [ns%d, ch%d] mode : %d\r\n", ns1->id, ch1, ns2->id, ch2, ssd->mode);
+    for( int i = 0 ; i < spp->luns_per_ch ; i++ ){
+        femu_log("[ CAST ] Swap physical chip [ch%d, lun%d] <-> [ch%d, lun%d]\r\n", 
+            swap_lun_list1[i]->ppa.g.ch, swap_lun_list1[i]->ppa.g.lun, swap_lun_list2[i]->ppa.g.ch, swap_lun_list2[i]->ppa.g.lun);
+    }
+
+    for( int i = 0 ; i < spp->luns_per_ch ; i++ ){
+        swap_lun_list1[i]->seamless_stage = 1;       // seamless stage
+        swap_lun_list2[i]->seamless_stage = 1;       // seamless stage
+        wp_block_close(ns1, swap_lun_list1[i]);
+        wp_block_close(ns2, swap_lun_list2[i]);
+
+        /* meta swap */
+        struct nand_lun *temp_lun = ns1->lun_list[ch1*spp->luns_per_ch+i];
+        ns1->lun_list[ch1*spp->luns_per_ch+i] = ns2->lun_list[ch2*spp->luns_per_ch+i];
+        ns2->lun_list[ch2*spp->luns_per_ch+i] = temp_lun;
+    }
+
+    ssd->logfile = fopen("log.txt","a");
+    fprintf(ssd->logfile, "Channel swap [ns%d, ch%d] <-> [ns%d, ch%d] mode : %d\r\n", ns1->id, ch1, ns2->id, ch2, ssd->mode);
+    fclose(ssd->logfile);
+
+    /* setting swap manager */
+    ssd->swap_mgmt.now_swapping = true;
+    ssd->swap_mgmt.mode = ssd->mode;
+    struct time_unit unit1 = get_previous_statistic(ns1->statistic, 60, 60, TRUE);
+    struct time_unit unit2 = get_previous_statistic(ns2->statistic, 60, 60, TRUE);
+    ssd->swap_mgmt.original_iops = unit1.iops + unit2.iops;
+
+    /* regist new swap task */
+    ssd->swap_mgmt.ns1 = ns1;
+    ssd->swap_mgmt.ns2 = ns2;
+    ssd->swap_mgmt.swap_start_time = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    ssd->swap_mgmt.block_start_time =  ssd->swap_mgmt.swap_start_time;
+
+    if( ssd->mode == MODE_SEAMLESS ){
+        ssd->swap_mgmt.swap_delay = spp->max_swap_time;
+        ssd->swap_mgmt.waiting_seamless = 1;
+    }else{
+        ssd->swap_mgmt.swap_delay = 0;
+        ssd->swap_mgmt.waiting_seamless = 0;
+    }
+
+    for( int i = 0 ; i < spp->luns_per_ch ; i++ ){
+        struct swap_task *task = g_malloc0(sizeof(struct swap_task));
+        task->ssd = ssd;
+        task->ns1 = ns1;
+        task->ns2 = ns2;
+        task->lun1 = swap_lun_list1[i];
+        task->lun2 = swap_lun_list2[i];
+        task->swap_timer = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+        task->swap_start_time = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+        task->block_start_time = task->swap_timer;
+
+        QTAILQ_INSERT_TAIL(ssd->swap_mgmt.task_list, task, entry); // for next tick
+    }
+
+    g_free(swap_lun_list1);
+    g_free(swap_lun_list2);
+    qemu_mutex_unlock(&swap_mutex);
+}
+
+void start_swap(struct ssd *ssd, struct NvmeNamespace *namespaces, int num_namespaces)
+{
+    struct NvmeNamespace *max_ns = NULL;
+    struct NvmeNamespace *min_ns = NULL;
+    int ch1 = 0, ch2 = 0;
+    uint64_t max_pe = 0;
+    uint64_t min_pe = MAX_PE*ssd->sp.blks_per_ch;
+
+    // fine max channel
+    for( int i = 0 ; i < num_namespaces ; i++){
+        for( int j = 0 ; j < ssd->sp.nchs ; j++){
+            int pe = 0;
+            for( int k = 0; k < ssd->sp.luns_per_ch ; k++ )
+                pe += ssd->ch[j].lun[k].erase_count;
+            if( max_pe < pe ){
+                max_pe = pe;
+                max_ns = &namespaces[i];
+                ch1 = j;
+            }
+        }
+    }
+
+    // fine min channel
+    for( int i = 0 ; i < num_namespaces ; i++){
+        for( int j = 0 ; j < ssd->sp.nchs ; j++){
+            int pe = 0;
+            for( int k = 0; k < ssd->sp.luns_per_ch ; k++ )
+                pe += ssd->ch[j].lun[k].erase_count;
+            if( (&namespaces[i] != max_ns || ch1 != j) && min_pe > pe){
+                min_pe = pe;
+                min_ns = &namespaces[i];
+                ch2 = j;
+            }
+        }
+    }
+
+    swap_channel(max_ns, ch1, min_ns, ch2);
+}
+
+void monitoring_to_file(struct ssd *ssd)
+{
+    char buff[32*1024];
+    char str[32*1024];
+    int len;
+    FILE *fp = fopen("monitoring.txt", "w");
+
+    memset(buff, 0, sizeof(buff));
+
+    for( int ch = 0; ch < ssd->sp.nchs; ch++ ){
+        for( int lun = 0; lun < ssd->sp.luns_per_ch; lun++ ){
+            sprintf(str, "%2dch %dchip freeblk %-4d ", ch, lun, ssd->ch[ch].lun[lun].pl[0].free_block_cnt);
+            sprintf(buff + len, "%s", str);
+            len+=strlen(str);
+            for( int blk = 0; blk < ssd->sp.blks_per_pl; blk++ ){
+                int vpc_perdec = (ssd->ch[ch].lun[lun].pl[0].blk[blk].vpc*10)/(ssd->sp.pgs_per_blk+1);
+                if(ssd->ch[ch].lun[lun].pl[0].blk[blk].state == BLOCK_FREE)
+                    sprintf(str, "_ ");
+                else if(ssd->ch[ch].lun[lun].pl[0].blk[blk].state == BLOCK_OPEN)
+                    sprintf(str, "%1d<", vpc_perdec);
+                else
+                    sprintf(str, "%1d ", vpc_perdec);
+                sprintf(buff + len, "%s", str);
+                len+=strlen(str);
+            }
+            fprintf(fp, "%s\n", buff);
+            memset(buff, 0, sizeof(buff));
+            len = 0;
+        }
+    }
+    fclose(fp);
+}
+
+void analyze(struct ssd *ssd, struct NvmeNamespace *namespaces, int num_namespaces)
+{
+    struct swap_mgmt *swap_mgmt = &ssd->swap_mgmt;
+    FILE *fp = fopen("analyze.txt", "w");
+    int max_pe = 0;
+    float avg_pe = 0.0f;
+
+    fprintf(fp, "     ");
+    for( int i = 0; i < ssd->sp.nchs ; i++ ){
+        fprintf(fp, " ch%-2d", i);
+    }
+    fprintf(fp, "\n");
+    
+    fprintf(fp, "PE   ");
+    for( int i = 0; i < ssd->sp.nchs ; i++ ){
+        int pe = 0;
+        for( int j = 0; j < ssd->sp.luns_per_ch ; j++ )
+            pe += ssd->ch[i].lun[j].erase_count;
+        fprintf(fp, " %4d", pe/ssd->sp.blks_per_ch);
+        if( pe > max_pe )
+            max_pe = pe;
+        avg_pe += (float)pe;
+    } 
+    avg_pe /= ssd->sp.tt_luns;
+    fprintf(fp, "\n");
+    
+    fprintf(fp, "PEAS ");
+    for( int i = 0; i < ssd->sp.nchs ; i++ ){
+        int pe = 0;
+        for( int j = 0; j < ssd->sp.luns_per_ch ; j++ )
+            pe += ssd->ch[i].lun[j].erase_count_after_swap;
+        fprintf(fp, " %4d", pe/ssd->sp.blks_per_ch);
+    } 
+    fprintf(fp, "\n");
+    uint64_t dev_write = 0;
+    for( int i = 0; i < num_namespaces ; i++ ){
+        struct NvmeNamespace *ns = &namespaces[i];
+        struct statistic *s = ns->statistic;
+        struct time_unit prev = get_previous_statistic(s, 120, 60, TRUE);
+        struct time_unit curr = get_previous_statistic(s, 60, 60, TRUE);
+        int iops_rate = curr.iops*100 / (prev.iops != 0 ? prev.iops : 1);
+        dev_write = s->tot->us_write + s->tot->gc_write + s->tot->wl_write;
+        float WAF = (float)dev_write / (s->tot->us_write+1.0f);
+        
+        fprintf(fp, "ns%d User_Write %ldGB GC_Write %ldGB WL_Write %ldGB Device_Write %ldGB WAF %.2f IOPS_Drop %d%% Waiting %d\n", ns->id,
+                PAGE_TO_GB(s->tot->us_write), PAGE_TO_GB(s->tot->gc_write), PAGE_TO_GB(s->tot->wl_write), PAGE_TO_GB(dev_write),
+                WAF, (int)iops_rate, ns->waiting_io);
+    }
+    
+    /* 초기 모니터링이 끝남 */
+    if( swap_mgmt->swap_status == 0 && avg_pe > 1.0f){
+        uint64_t ssd_total_life = ssd->sp.tt_secs*ssd->sp.secsz*MAX_PE;
+        uint64_t total_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME)-ssd->start_log_time;
+        uint64_t dev_wearout = (dev_write*ssd->sp.secs_per_pg*ssd->sp.secsz)/total_ns;
+        swap_mgmt->swap_frequency = (ssd_total_life/dev_wearout)/160;
+        swap_mgmt->next_swap_time = ssd->start_log_time + swap_mgmt->swap_frequency;
+        swap_mgmt->swap_status = 1;
+    }
+
+    fprintf(fp,"Max PE %d AVG PE %.1f Imbalance %.2f \n", max_pe/ssd->sp.luns_per_ch, avg_pe, avg_pe!=0?(float)max_pe/avg_pe:1.0f);
+    fprintf(fp,"Swap Frequency %ld  Next Swap Time %ld \n", NS_TO_SEC(swap_mgmt->swap_frequency), NS_TO_SEC(swap_mgmt->next_swap_time - ssd->start_log_time));
+    fprintf(fp,"MODE :%d\n", ssd->mode);
+
+    if(swap_mgmt->now_swapping){
+        uint64_t curr_iops = get_previous_statistic(swap_mgmt->ns1->statistic, 60, 60, TRUE).iops + get_previous_statistic(swap_mgmt->ns2->statistic, 60, 60, TRUE).iops;
+        float iops_drop = (float)curr_iops/(float)(swap_mgmt->original_iops+0.1f);
+        fprintf(fp,"Original IOPS %ld\t Current IOPS %ld\t Drop%.2f%%\t swap_delay %ldsec\n", swap_mgmt->original_iops, curr_iops, iops_drop*100, NS_TO_SEC(swap_mgmt->swap_delay));
     }
     fclose(fp);
 }
@@ -940,21 +1470,28 @@ static void *ftl_thread(void *arg)
 {
     FemuCtrl *n = (FemuCtrl *)arg;
     struct ssd *ssd = n->ssd;
+    struct swap_mgmt *swap_mgmt = &ssd->swap_mgmt; 
+    struct swap_task *task, *temp;
     NvmeRequest *req = NULL;
     uint64_t lat = 0;
     int rc;
     int i;
 
     ftl_start = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
-    ssd->next_log_time = ftl_start + 1*1000*1000*1000;
+    ssd->start_log_time = ftl_start;
+    ssd->next_log_time = ssd->start_log_time + 1*1000*1000*1000;
     while (!*(ssd->dataplane_started_ptr)) {
         usleep(100000);
     }
+
+    qemu_mutex_init(&swap_mutex);
 
     /* FIXME: not safe, to handle ->to_ftl and ->to_poller gracefully */
     ssd->to_ftl = n->to_ftl;
     ssd->to_poller = n->to_poller;
     while (1) {
+
+        qemu_mutex_lock(&swap_mutex);
         for (i = 1; i <= n->nr_pollers; i++) {
             if (!ssd->to_ftl[i] || !femu_ring_count(ssd->to_ftl[i]))
                 continue;
@@ -978,7 +1515,7 @@ static void *ftl_thread(void *arg)
                 break;
             default:
                 ftl_err("FTL received unkown request type, ERROR\n");
-                ;
+                break;
             }
 
             req->reqlat = lat;
@@ -991,23 +1528,105 @@ static void *ftl_thread(void *arg)
             if (should_gc(req->ns)) {
                 do_gc(req->ns, false);
             }
-
-            check_chip_gc(req->ns);
         }
 
+        /* 반복작업 */
         uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
-        if( now >= ssd->next_log_time ){
-            /* flush to file */
-            flush_to_file(ssd->statistics, n->num_namespaces);
-            monitoring_to_file(n);
-            for (int j = 0; j < n->num_namespaces; j++){
-                 /* init time unit */
-                one_clock(n->namespaces[j].statistic);
+
+        if(swap_mgmt->swap_status == 1 && swap_mgmt->next_swap_time){
+            start_swap(ssd, n->namespaces, n->num_namespaces);
+            swap_mgmt->next_swap_time += swap_mgmt->swap_frequency;
+        }
+
+        /* swap_task 처리 */
+        if( swap_mgmt->waiting_seamless ){
+            uint64_t curr_iops = get_previous_statistic(swap_mgmt->ns1->statistic, 60, 60, TRUE).iops + get_previous_statistic(swap_mgmt->ns2->statistic, 60, 60, TRUE).iops;
+            double iops_drop = (double)curr_iops/(double)(swap_mgmt->original_iops+0.1f);
+            if(iops_drop < 1){
+                iops_drop = iops_drop > 0.01f ? iops_drop : 0.01f;
+                swap_mgmt->swap_delay = (uint64_t)(iops_drop*(double)ssd->sp.max_swap_time);
             }
+            if(swap_mgmt->swap_start_time + swap_mgmt->swap_delay <= now){
+                ssd->logfile = fopen("log.txt","a");
+                fprintf(ssd->logfile, "ORIGIN IOPS %ld CURRENT IOPS %ld drop %.2f %ld %ld\n", swap_mgmt->original_iops, curr_iops, iops_drop, swap_mgmt->swap_delay, ssd->sp.max_swap_time);
+                fclose(ssd->logfile);
+                swap_mgmt->waiting_seamless = 0;
+                swap_mgmt->swap_delay = 0;
+            }
+        }else{
+            QTAILQ_FOREACH_SAFE(task, swap_mgmt->task_list, entry, temp) {
+                if (task->swap_timer <= now) {
+                    switch(ssd->mode) {
+                        case  MODE_NORMAL:
+                            task->swap_timer = swap_lun(task);
+                            break;
+                        case  MODE_ADAPTIVE:
+                            task->swap_timer = swap_lun_adaptive(task);
+                            break;
+                        case  MODE_SEAMLESS:
+                            task->swap_timer = swap_lun_adaptive(task);
+                            break;
+                    }
+                }
+                /* some task is fisished */
+                if (task->swap_timer == 0) {
+                    finish_swap_lun(task);
+                    QTAILQ_REMOVE(swap_mgmt->task_list, task, entry);
+                    free(task);
+
+                    /* all tasks are finished */
+                    if(QTAILQ_EMPTY(swap_mgmt->task_list)){
+                        ssd->logfile = fopen("log.txt","a");
+                        fprintf(ssd->logfile, "ns%d ns%d swap_start %ld block_swap_start %ld swap_time %ld block_swap_time %ld mode %d\n",
+                            ssd->swap_mgmt.ns1->id, ssd->swap_mgmt.ns2->id, 
+                            NS_TO_SEC(ssd->swap_mgmt.swap_start_time - ssd->start_log_time), 
+                            NS_TO_SEC(ssd->swap_mgmt.block_start_time - ssd->start_log_time),
+                            NS_TO_SEC(now - ssd->swap_mgmt.swap_start_time),
+                            NS_TO_SEC(now - ssd->swap_mgmt.block_start_time),
+                            ssd->mode);
+                        fclose(ssd->logfile);
+
+                        ssd->swap_mgmt.now_swapping = false;
+                        ssd->swap_mgmt.ns1 = ssd->swap_mgmt.ns2 = NULL;
+                    }
+                }
+            }
+        }
+        
+        /* 0.1sec timer */
+        if( now >= ssd->next_log_time ){
+            switch ((now/(100*1000*1000))%10)
+            {
+            case 0:     // every x.0 sec
+                /* flush to file */
+                flush_to_file(ssd->statistics, n->num_namespaces);
+                /* increse one second */
+                one_clock(ssd->statistics, n->num_namespaces);
+                break;
+            case 1: // every x.1 sec
+                    // lat
+                for (int j = 0; j < n->num_namespaces; j++) {
+                    lat_to_file(n->namespaces[j].lat_list, j, FALSE);
+                }
+                break;
+            case 2: // every x.2 sec
+                    // tail lat
+                for (int j = 0; j < n->num_namespaces; j++) {
+                    lat_to_file(n->namespaces[j].swap_lat_list, j, TRUE);
+                }
+                break;
+            }
+            // every 0.1 sec
+            monitoring_to_file(ssd);
+
+            analyze(ssd, n->namespaces, n->num_namespaces);
 
             /* timer setting */
-            ssd->next_log_time += 1000*1000*1000;
+            ssd->next_log_time += 100*1000*1000;
         }
+
+
+        qemu_mutex_unlock(&swap_mutex);
     }
     return NULL;
 }

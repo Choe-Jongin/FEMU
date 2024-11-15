@@ -93,7 +93,69 @@ static uint16_t bb_admin_cmd(FemuCtrl *n, NvmeCmd *cmd)
     switch (cmd->opcode) {
     case NVME_ADM_CMD_FEMU_FLIP:
         bb_flip(n, cmd);
-        return NVME_SUCCESS;        
+        return NVME_SUCCESS;
+
+    case 0x32:      // 명시적 swap
+        int nsid1, ch1, nsid2, ch2;
+
+        nsid1 = le64_to_cpu(cmd->cdw10);
+        ch1   = le64_to_cpu(cmd->cdw11);
+        nsid2 = le64_to_cpu(cmd->cdw12);
+        ch2   = le64_to_cpu(cmd->cdw13);
+
+        struct NvmeNamespace *ns1 = &n->namespaces[nsid1-1];
+        struct NvmeNamespace *ns2 = &n->namespaces[nsid2-1];
+
+        swap_channel(ns1, ch1, ns2, ch2);
+
+        return NVME_SUCCESS;
+
+    case 0x33:     // set mode
+        int mode;
+        mode = le64_to_cpu(cmd->cdw10);
+        switch (mode){
+            case 0: 
+                femu_log("[ CAST ] Baseline Swap\n\r");
+                n->ssd->mode = MODE_NORMAL;
+                break;
+            case 1: 
+                femu_log("[ CAST ] Adaptive Swap\n\r");
+                n->ssd->mode = MODE_ADAPTIVE;
+                break;
+            case 2: 
+                femu_log("[ CAST ] Seamless Swap\n\r");
+                n->ssd->mode = MODE_SEAMLESS;
+                break;
+        }
+        return NVME_SUCCESS;
+
+    case 0x34:      // start logging
+        for (int j = 0; j < n->num_namespaces; j++){
+            statistic_delete(n->namespaces[j].statistic);
+            statistic_init(n->namespaces[j].statistic);
+
+            delete_lat_list(n->namespaces[j].lat_list);
+            delete_lat_list(n->namespaces[j].swap_lat_list);
+            n->namespaces[j].lat_list = new_lat_list();
+            n->namespaces[j].swap_lat_list = new_lat_list();
+        }
+
+        n->ssd->start_log_time = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+        n->ssd->next_log_time = n->ssd->start_log_time + 1*1000*1000*1000;
+        return NVME_SUCCESS;
+
+    case 0x35:      // fast IO mode
+        n->ssd->sp.pg_rd_lat = 1000;
+        n->ssd->sp.pg_wr_lat = 1000;
+        femu_log("[ CAST ] Fast IO mode\n\r");
+        return NVME_SUCCESS;
+
+    case 0x36:     // normal IO mode
+        n->ssd->sp.pg_rd_lat = n->bb_params.pg_rd_lat;
+        n->ssd->sp.pg_wr_lat = n->bb_params.pg_wr_lat;
+        femu_log("[ CAST ] Normal IO mode\n\r");
+        return NVME_SUCCESS;
+
     default:
         return NVME_INVALID_OPCODE | NVME_DNR;
     }

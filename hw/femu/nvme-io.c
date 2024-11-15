@@ -1,4 +1,5 @@
 #include "./nvme.h"
+#include "bbssd/ftl.h"
 
 static uint16_t nvme_io_cmd(FemuCtrl *n, NvmeCmd *cmd, NvmeRequest *req);
 
@@ -161,6 +162,13 @@ static void nvme_process_cq_cpl(void *arg, int index_poller)
         pqueue_pop(pq);
         processed++;
         n->nr_tt_ios++;
+        req->ns->waiting_io--;
+
+        if(req->ns == req->ns->ssd->swap_mgmt.ns1 || req->ns == req->ns->ssd->swap_mgmt.ns2 ) {
+            add_lat(req->ns->swap_lat_list, req->reqlat);
+        }else{
+            add_lat(req->ns->lat_list, req->reqlat);
+        }
 
         if (now - req->expire_time >= 20000) {
             n->nr_tt_late_ios++;
@@ -431,6 +439,7 @@ static uint16_t nvme_io_cmd(FemuCtrl *n, NvmeCmd *cmd, NvmeRequest *req)
     }
 
     req->ns = ns = &n->namespaces[nsid - 1];
+    req->ns->waiting_io++;
 
     switch (cmd->opcode) {
     case NVME_CMD_FLUSH:
