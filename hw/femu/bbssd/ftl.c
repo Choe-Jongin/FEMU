@@ -929,6 +929,25 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
     return maxlat;
 }
 
+void ssd_dsm(struct NvmeNamespace *ns, uint64_t slba, uint64_t nlb)
+{
+    struct ppa ppa;
+    uint64_t lpn;
+
+    for (lpn = slba; lpn < slba + nlb; lpn++) {
+        ppa = get_maptbl_ent(ns, lpn);
+        if (mapped_ppa(&ppa)) {
+            // femu_log("ns%d delete lba %ld\n", ns->id, lpn);
+            /* update old page information first */
+            mark_page_invalid(ns, &ppa);
+            set_rmap_ent(ns, INVALID_LPN, &ppa);
+
+            ppa.ppa = UNMAPPED_PPA;
+            set_maptbl_ent(ns, lpn, &ppa);
+        }
+    }
+}
+
 static void wl_read_page(NvmeNamespace *ns, struct ppa *ppa)
 {
     struct nand_cmd wlr;

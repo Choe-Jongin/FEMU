@@ -325,6 +325,9 @@ static uint16_t nvme_dsm(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
             }
 
             bitmap_clear(ns->util, slba, nlb);
+
+            /* CAST Lab */
+            ssd_dsm(ns, slba, nlb);
         }
         g_free(range);
     }
