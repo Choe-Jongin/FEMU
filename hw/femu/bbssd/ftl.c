@@ -1261,7 +1261,7 @@ void swap_channel(struct NvmeNamespace *ns1, int ch1, struct NvmeNamespace *ns2,
     /* TODO : sort lun_list1 by erase count */
     // do something
 
-    femu_log("[ CAST ] Channel swap [ns%d, ch%d] <-> [ns%d, ch%d] mode : %d\r\n", ns1->id, ch1, ns2->id, ch2, ssd->mode);
+    femu_log("[ CAST ] time:%ld Channel swap [ns%d, ch%d] <-> [ns%d, ch%d] mode : %d\r\n", NS_TO_SEC(qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - ssd->start_log_time), ns1->id, ch1, ns2->id, ch2, ssd->mode);
     for( int i = 0 ; i < spp->luns_per_ch ; i++ ){
         femu_log("[ CAST ] Swap physical chip [ch%d, lun%d] <-> [ch%d, lun%d]\r\n", 
             swap_lun_list1[i]->ppa.g.ch, swap_lun_list1[i]->ppa.g.lun, swap_lun_list2[i]->ppa.g.ch, swap_lun_list2[i]->ppa.g.lun);
@@ -1333,10 +1333,11 @@ void start_swap(struct ssd *ssd, struct NvmeNamespace *namespaces, int num_names
 
     // fine max channel
     for( int i = 0 ; i < num_namespaces ; i++){
-        for( int j = 0 ; j < ssd->sp.nchs ; j++){
+        int nchs = namespaces[i].nluns/ssd->sp.luns_per_ch;
+        for( int j = 0 ; j < nchs ; j++){
             int pe = 0;
             for( int k = 0; k < ssd->sp.luns_per_ch ; k++ )
-                pe += ssd->ch[j].lun[k].erase_count;
+                pe += namespaces[i].lun_list[j*ssd->sp.luns_per_ch + k]->erase_count_after_swap;
             if( max_pe < pe ){
                 max_pe = pe;
                 max_ns = &namespaces[i];
@@ -1347,10 +1348,11 @@ void start_swap(struct ssd *ssd, struct NvmeNamespace *namespaces, int num_names
 
     // fine min channel
     for( int i = 0 ; i < num_namespaces ; i++){
-        for( int j = 0 ; j < ssd->sp.nchs ; j++){
+        int nchs = namespaces[i].nluns/ssd->sp.luns_per_ch;
+        for( int j = 0 ; j < nchs ; j++){
             int pe = 0;
             for( int k = 0; k < ssd->sp.luns_per_ch ; k++ )
-                pe += ssd->ch[j].lun[k].erase_count;
+                pe += namespaces[i].lun_list[j*ssd->sp.luns_per_ch + k]->erase_count;
             if( (&namespaces[i] != max_ns || ch1 != j) && min_pe > pe){
                 min_pe = pe;
                 min_ns = &namespaces[i];
@@ -1401,6 +1403,8 @@ void analyze(struct ssd *ssd, struct NvmeNamespace *namespaces, int num_namespac
     FILE *fp = fopen("analyze.txt", "w");
     int max_pe = 0;
     float avg_pe = 0.0f;
+    uint64_t total_time = NS_TO_SEC(qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - ssd->start_log_time);
+    fprintf(fp, "time : %ld\n", total_time);
 
     fprintf(fp, "     ");
     for( int i = 0; i < ssd->sp.nchs ; i++ ){
@@ -1445,18 +1449,22 @@ void analyze(struct ssd *ssd, struct NvmeNamespace *namespaces, int num_namespac
                 WAF, (int)iops_rate, ns->waiting_io);
     }
     
+    uint64_t dev_wearout = (ssd_dev_write*ssd->sp.secs_per_pg*ssd->sp.secsz)/total_time;
+    uint64_t ssd_total_life = (uint64_t)ssd->sp.tt_secs*ssd->sp.secsz*MAX_PE;
+
     /* 초기 모니터링이 끝남 */
-    if( swap_mgmt->swap_status == 0 && avg_pe > 1.0f){
-        uint64_t ssd_total_life = (uint64_t)ssd->sp.tt_secs*ssd->sp.secsz*MAX_PE;
-        uint64_t total_time = NS_TO_SEC(qemu_clock_get_ns(QEMU_CLOCK_REALTIME)-ssd->start_log_time);
-        uint64_t dev_wearout = (ssd_dev_write*ssd->sp.secs_per_pg*ssd->sp.secsz)/total_time;
-        swap_mgmt->swap_frequency = ((ssd_total_life/(dev_wearout?1:dev_wearout))/160)*1000000000;
+    if( swap_mgmt->swap_status == 0 && avg_pe >= 0.2f){
+        swap_mgmt->swap_frequency = ((ssd_total_life/(dev_wearout?dev_wearout:1))/160)*1000000000;
         swap_mgmt->next_swap_time = ssd->start_log_time + swap_mgmt->swap_frequency;
         swap_mgmt->swap_status = 1;
     }
 
-    fprintf(fp,"Max PE %d AVG PE %.1f Imbalance %.2f \n", max_pe/ssd->sp.blks_per_ch, avg_pe, avg_pe!=0?(float)max_pe/avg_pe:1.0f);
-    fprintf(fp,"Swap Frequency %ld  Next Swap Time %ld \n", NS_TO_SEC(swap_mgmt->swap_frequency), NS_TO_SEC(swap_mgmt->next_swap_time - ssd->start_log_time));
+    fprintf(fp,"Max PE %d AVG PE %.2f Imbalance %.2f \n", max_pe/ssd->sp.blks_per_ch, avg_pe, avg_pe!=0?(float)max_pe/avg_pe:1.0f);
+    fprintf(fp,"Device Wearout %ldMB/s  Lifetime %ldmin  Swap Frequency %ld  Next Swap Time %ld \n", 
+        dev_wearout/1024/1024, 
+        ssd_total_life/(dev_wearout?dev_wearout:1)/60,
+        NS_TO_SEC(swap_mgmt->swap_frequency),
+        NS_TO_SEC(swap_mgmt->next_swap_time - ssd->start_log_time));
     fprintf(fp,"MODE :%d\n", ssd->mode);
 
     if(swap_mgmt->now_swapping){
@@ -1530,11 +1538,16 @@ static void *ftl_thread(void *arg)
                 do_gc(req->ns, false);
             }
         }
+        qemu_mutex_unlock(&swap_mutex);
 
         /* 반복작업 */
         uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
 
-        if(swap_mgmt->swap_status == 1 && swap_mgmt->next_swap_time){
+        if(swap_mgmt->swap_status == 1 && now > swap_mgmt->next_swap_time){
+            // femu_log("now %ld next_swap_time %ld  logtime %ld next_swap_time %ld\n", 
+            //     now, swap_mgmt->next_swap_time, 
+            //     NS_TO_SEC(ssd->start_log_time),
+            //     NS_TO_SEC(swap_mgmt->next_swap_time - ssd->start_log_time));
             start_swap(ssd, n->namespaces, n->num_namespaces);
             swap_mgmt->next_swap_time += swap_mgmt->swap_frequency;
         }
@@ -1626,8 +1639,6 @@ static void *ftl_thread(void *arg)
             ssd->next_log_time += 100*1000*1000;
         }
 
-
-        qemu_mutex_unlock(&swap_mutex);
     }
     return NULL;
 }
