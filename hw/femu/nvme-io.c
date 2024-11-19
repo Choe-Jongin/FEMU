@@ -300,36 +300,32 @@ static uint16_t nvme_dsm(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
     int i;
 
     if (dw11 & NVME_DSMGMT_AD) {
-        uint16_t nr = (dw10 & 0xff) + 1;
+        req->nr = (dw10 & 0xff) + 1;
 
         uint64_t slba;
         uint32_t nlb;
-        NvmeDsmRange *range = g_malloc0(sizeof(NvmeDsmRange) * nr);
+        req->range = g_malloc0(sizeof(NvmeDsmRange) * req->nr);
 
-        if (dma_write_prp(n, (uint8_t *)range, sizeof(range), prp1, prp2)) {
+        if (dma_write_prp(n, (uint8_t *)req->range, sizeof(NvmeDsmRange), prp1, prp2)) {
             nvme_set_error_page(n, req->sq->sqid, cmd->cid, NVME_INVALID_FIELD,
                                 offsetof(NvmeCmd, dptr.prp1), 0, ns->id);
-            g_free(range);
+            g_free(req->range);
             return NVME_INVALID_FIELD | NVME_DNR;
         }
 
         req->status = NVME_SUCCESS;
-        for (i = 0; i < nr; i++) {
-            slba = le64_to_cpu(range[i].slba);
-            nlb = le32_to_cpu(range[i].nlb);
+        for (i = 0; i < req->nr; i++) {
+            slba = le64_to_cpu(req->range[i].slba);
+            nlb = le32_to_cpu(req->range[i].nlb);
             if (slba + nlb > le64_to_cpu(ns->id_ns.nsze)) {
                 nvme_set_error_page(n, req->sq->sqid, cmd->cid, NVME_LBA_RANGE,
                                     offsetof(NvmeCmd, cdw10), slba + nlb, ns->id);
-                g_free(range);
+                g_free(req->range);
                 return NVME_LBA_RANGE | NVME_DNR;
             }
 
             bitmap_clear(ns->util, slba, nlb);
-
-            /* CAST Lab */
-            ssd_dsm(ns, slba, nlb);
         }
-        g_free(range);
     }
     return NVME_SUCCESS;
 }

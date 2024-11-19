@@ -929,23 +929,38 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
     return maxlat;
 }
 
-void ssd_dsm(struct NvmeNamespace *ns, uint64_t slba, uint64_t nlb)
+static uint64_t ssd_dsm(struct ssd *ssd, NvmeRequest *req)
 {
+    struct NvmeNamespace *ns = req->ns;
+    struct ssdparams *spp = &ssd->sp;
     struct ppa ppa;
     uint64_t lpn;
+    int i;
+    uint64_t curlat = 0, maxlat = 0;
 
-    for (lpn = slba; lpn < slba + nlb; lpn++) {
-        ppa = get_maptbl_ent(ns, lpn);
-        if (mapped_ppa(&ppa)) {
-            // femu_log("ns%d delete lba %ld\n", ns->id, lpn);
-            /* update old page information first */
-            mark_page_invalid(ns, &ppa);
-            set_rmap_ent(ns, INVALID_LPN, &ppa);
+    for (i = 0; i < req->nr; i++) {
+        uint64_t slba = le64_to_cpu(req->range[i].slba);
+        uint32_t nlb = le32_to_cpu(req->range[i].nlb);
 
-            ppa.ppa = UNMAPPED_PPA;
-            set_maptbl_ent(ns, lpn, &ppa);
+        /* CAST Lab */
+        uint64_t start_lpn = slba / spp->secs_per_pg;
+        uint64_t end_lpn = (slba + nlb - 1) / spp->secs_per_pg;
+
+        for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
+            ppa = get_maptbl_ent(ns, lpn);
+            if (mapped_ppa(&ppa)) {
+                mark_page_invalid(ns, &ppa);
+                set_rmap_ent(ns, INVALID_LPN, &ppa);
+                ppa.ppa = UNMAPPED_PPA;
+                set_maptbl_ent(ns, lpn, &ppa);
+                curlat = 0; /* page invalidation latency */
+                maxlat = (curlat > maxlat) ? curlat : maxlat;
+            }
         }
     }
+    g_free(req->range);
+
+    return maxlat;
 }
 
 static void wl_read_page(NvmeNamespace *ns, struct ppa *ppa)
@@ -1472,7 +1487,7 @@ void analyze(struct ssd *ssd, struct NvmeNamespace *namespaces, int num_namespac
     uint64_t ssd_total_life = (uint64_t)ssd->sp.tt_secs*ssd->sp.secsz*MAX_PE;
 
     /* 초기 모니터링이 끝남 */
-    if( swap_mgmt->swap_status == 0 && avg_pe >= 0.2f){
+    if( swap_mgmt->swap_status == 0 && avg_pe >= 0.5f){
         swap_mgmt->swap_frequency = ((ssd_total_life/(dev_wearout?dev_wearout:1))/160)*1000000000;
         swap_mgmt->next_swap_time = ssd->start_log_time + swap_mgmt->swap_frequency;
         swap_mgmt->swap_status = 1;
@@ -1539,7 +1554,7 @@ static void *ftl_thread(void *arg)
                 lat = ssd_read(ssd, req);
                 break;
             case NVME_CMD_DSM:
-                lat = 0;
+                lat = ssd_dsm(ssd, req);
                 break;
             default:
                 ftl_err("FTL received unkown request type, ERROR\n");
