@@ -134,8 +134,11 @@ static uint16_t bb_admin_cmd(FemuCtrl *n, NvmeCmd *cmd)
             statistic_delete(n->namespaces[j].statistic);
             statistic_init(n->namespaces[j].statistic);
 
-            // delete_lat_list(n->namespaces[j].lat_list);
-            // n->namespaces[j].lat_list = new_lat_list();
+            delete_lat_list(n->namespaces[j].lat_list);
+            delete_lat_list(n->namespaces[j].swap_lat_list);
+            
+            n->namespaces[j].lat_list = new_lat_list();
+            n->namespaces[j].swap_lat_list = new_lat_list();
         }
 
         n->ssd->start_log_time = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);

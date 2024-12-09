@@ -306,7 +306,7 @@ static uint16_t nvme_dsm(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
         uint32_t nlb;
         req->range = g_malloc0(sizeof(NvmeDsmRange) * req->nr);
 
-        if (dma_write_prp(n, (uint8_t *)req->range, sizeof(NvmeDsmRange), prp1, prp2)) {
+        if (dma_write_prp(n, (uint8_t *)req->range, sizeof(NvmeDsmRange)*req->nr, prp1, prp2)) {
             nvme_set_error_page(n, req->sq->sqid, cmd->cid, NVME_INVALID_FIELD,
                                 offsetof(NvmeCmd, dptr.prp1), 0, ns->id);
             g_free(req->range);

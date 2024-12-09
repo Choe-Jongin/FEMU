@@ -263,7 +263,7 @@ void ns_init(FemuCtrl *n, NvmeNamespace *ns);
 void ssd_init(FemuCtrl *n);
 void swap_channel(struct NvmeNamespace *ns1, int ch1, struct NvmeNamespace *ns2, int ch2);
 void start_swap(struct ssd *ssd, struct NvmeNamespace *namespaces, int num_namespaces);
-#define FEMU_DEBUG_FTL
+#define 
 #ifdef FEMU_DEBUG_FTL
 #define ftl_debug(fmt, ...) \
     do { printf("[FEMU] FTL-Dbg: " fmt, ## __VA_ARGS__); } while (0)

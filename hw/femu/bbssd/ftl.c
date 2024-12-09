@@ -205,7 +205,7 @@ static struct nand_block *get_next_free_block(struct nand_lun *lun)
 
     curr_block = QTAILQ_FIRST(&pl->free_block_list);
     if (!curr_block) {
-        femu_log("No free block here!! ch%d chip%d \r\n", lun->ppa.g.ch, lun->ppa.g.lun);
+        // femu_log("No free block here!! ch%d chip%d \r\n", lun->ppa.g.ch, lun->ppa.g.lun);
         return NULL;
     }
 
@@ -599,7 +599,12 @@ static void mark_page_invalid(struct NvmeNamespace *ns, struct ppa *ppa)
 
     /* update corresponding page status */
     pg = get_pg(ns->ssd, ppa);
-    ftl_assert(pg->status == PG_VALID);
+    //ftl_assert(pg->status == PG_VALID);
+    if(pg->status != PG_VALID){
+        femu_log("this page is not valid\n");
+        return ;
+    }
+
     pg->status = PG_INVALID;
 
     /* update corresponding block status */
@@ -707,13 +712,15 @@ static struct nand_block *select_victim_block(struct NvmeNamespace *ns, bool for
     struct nand_lun *lun = NULL;
     struct nand_block *victim_block = NULL;
     int min_vpc = ns->ssd->sp.pgs_per_blk;
+    int min_free_blk = ns->ssd->sp.blks_per_lun;
     int lun_index = -1;
     
     /* search minimum vpc block across all luns in ns */
     for( int i = 0; i < ns->nluns; i++ ){
         lun = ns->lun_list[i];
         victim_block = pqueue_peek(lun->victim_block_pq);
-        if( victim_block != NULL && victim_block->vpc < min_vpc){
+        if( victim_block != NULL && ((victim_block->vpc == min_vpc && lun->pl[0].free_block_cnt <= min_free_blk) || victim_block->vpc < min_vpc)){
+            min_free_blk = lun->pl[0].free_block_cnt;
             min_vpc = victim_block->vpc;
             lun_index = i;
         }
@@ -727,7 +734,7 @@ static struct nand_block *select_victim_block(struct NvmeNamespace *ns, bool for
     lun = ns->lun_list[lun_index];
     victim_block = pqueue_peek(lun->victim_block_pq);
     if (!force && victim_block->ipc < ns->ssd->sp.pgs_per_blk / 8) { 
-        femu_log("[ CAST ] Failed to select victim block ns%d vpc%d ipc%d \r\n",ns->id, victim_block->vpc, victim_block->ipc);
+        femu_log("[ CAST ] Failed to select victim block ns%d ch%d lun%d vpc%d ipc%d \r\n",ns->id, lun->ppa.g.ch, lun->ppa.g.lun, victim_block->vpc, victim_block->ipc);
         return NULL;
     }  
 
@@ -811,6 +818,14 @@ static inline bool should_gc(struct NvmeNamespace *ns)
 {
     struct nand_lun *lun;
     int free_block_cnt = 0;
+
+    for( int i = 0; i < ns->nluns; i++ ){
+        lun = ns->lun_list[i];
+        struct nand_block *victim_block = pqueue_peek(lun->victim_block_pq);
+        if( victim_block != NULL && victim_block->vpc == 0 ){
+            return true;
+        }
+    }
 
     for (int i = 0; i < ns->nluns; i++){
         lun = ns->lun_list[i];
@@ -948,7 +963,8 @@ static uint64_t ssd_dsm(struct ssd *ssd, NvmeRequest *req)
 
         for (lpn = start_lpn; lpn <= end_lpn; lpn++) {
             ppa = get_maptbl_ent(ns, lpn);
-            if (mapped_ppa(&ppa)) {
+
+            if (mapped_ppa(&ppa) && get_pg(ssd, &ppa)->status == PG_VALID){
                 mark_page_invalid(ns, &ppa);
                 set_rmap_ent(ns, INVALID_LPN, &ppa);
                 ppa.ppa = UNMAPPED_PPA;
@@ -1372,7 +1388,7 @@ void start_swap(struct ssd *ssd, struct NvmeNamespace *namespaces, int num_names
             int pe = 0;
             for( int k = 0; k < ssd->sp.luns_per_ch ; k++ )
                 pe += namespaces[i].lun_list[j*ssd->sp.luns_per_ch + k]->erase_count_after_swap;
-            if( max_pe < pe ){
+            if( max_pe <= pe ){
                 max_pe = pe;
                 max_ns = &namespaces[i];
                 ch1 = j;
@@ -1387,7 +1403,7 @@ void start_swap(struct ssd *ssd, struct NvmeNamespace *namespaces, int num_names
             int pe = 0;
             for( int k = 0; k < ssd->sp.luns_per_ch ; k++ )
                 pe += namespaces[i].lun_list[j*ssd->sp.luns_per_ch + k]->erase_count;
-            if( (&namespaces[i] != max_ns || ch1 != j) && min_pe > pe){
+            if( (&namespaces[i] != max_ns || ch1 != j) && min_pe >= pe){
                 min_pe = pe;
                 min_ns = &namespaces[i];
                 ch2 = j;
@@ -1402,7 +1418,7 @@ void monitoring_to_file(struct ssd *ssd)
 {
     char buff[32*1024];
     char str[32*1024];
-    int len;
+    int len = 0;
     FILE *fp = fopen("monitoring.txt", "w");
 
     memset(buff, 0, sizeof(buff));
@@ -1439,6 +1455,15 @@ void analyze(struct ssd *ssd, struct NvmeNamespace *namespaces, int num_namespac
     float avg_pe = 0.0f;
     uint64_t total_time = NS_TO_SEC(qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - ssd->start_log_time);
     fprintf(fp, "time : %ld\n", total_time);
+
+    for( int i = 0; i < num_namespaces ; i++ ){
+        NvmeNamespace *ns = &namespaces[i];
+        fprintf(fp,"ns%d>", i+1);
+        for( int j = 0 ; j < ns->nluns ; j++){
+            fprintf(fp,"[ch%-2d lun%d] ", ns->lun_list[j]->ppa.g.ch, ns->lun_list[j]->ppa.g.lun);
+        }
+        fprintf(fp,"\r\n");
+    }
 
     fprintf(fp, "     ");
     for( int i = 0; i < ssd->sp.nchs ; i++ ){
@@ -1493,7 +1518,7 @@ void analyze(struct ssd *ssd, struct NvmeNamespace *namespaces, int num_namespac
         swap_mgmt->swap_status = 1;
     }
 
-    fprintf(fp,"Max PE %d AVG PE %.2f Imbalance %.2f \n", max_pe/ssd->sp.blks_per_ch, avg_pe, avg_pe!=0?(float)max_pe/avg_pe:1.0f);
+    fprintf(fp,"Max PE %d AVG PE %.2f Imbalance %.2f \n", max_pe/ssd->sp.blks_per_ch, avg_pe, avg_pe!=0?(float)max_pe/ssd->sp.tt_blks/avg_pe:1.0f);
     fprintf(fp,"Device Wearout %ldMB/s  Lifetime %ldmin  Swap Frequency %ld  Next Swap Time %ld \n", 
         dev_wearout/1024/1024, 
         ssd_total_life/(dev_wearout?dev_wearout:1)/60,

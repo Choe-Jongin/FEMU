@@ -119,14 +119,14 @@ void flush_to_file(struct statistic *statistics, int num)
 
         fprintf(fp, "[time ]");
         for( int i = 0; i < num + 1; i++ ){
-            fprintf(fp, " read  write gcwrt wlred wlwrt lungc |");
+            fprintf(fp, "  read write gcwrt wlred wlwrt lungc |");
         }
         fprintf(fp, "\n");
     }else{
         fp = fopen("data.txt", "a");
     }
     memset(buff, 0, sizeof(buff));
-    sprintf(buff+strlen(buff), "[%5d] ", statistics[0].sec+1);
+    sprintf(buff+strlen(buff), "[%5d]", statistics[0].sec+1);
     for( int i = 0; i < num; i++ ){
         struct time_unit *u = statistics[i].cur;
         tot_us_read+=u->us_read;
@@ -134,10 +134,10 @@ void flush_to_file(struct statistic *statistics, int num)
         tot_gc_write+=u->gc_write;
         tot_wl_read+=u->wl_read;
         tot_wl_write+=u->wl_write;
-        sprintf(buff+strlen(buff),"%5ld %5ld %5ld %5ld %5ld %5ld |", 
+        sprintf(buff+strlen(buff)," %5ld %5ld %5ld %5ld %5ld %5ld |", 
             u->us_read, u->us_write, u->gc_write, u->wl_read, u->wl_write, u->chip_gc);
     }
-    sprintf(    buff+strlen(buff),"%5ld %5ld %5ld %5ld %5ld %5ld", 
+    sprintf(    buff+strlen(buff)," %5ld %5ld %5ld %5ld %5ld %5ld", 
         tot_us_read, tot_us_write, tot_gc_write, tot_wl_read, tot_wl_write, tot_chip_gc);
     
     fprintf(fp, "%s\n", buff);
